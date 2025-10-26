@@ -1,4 +1,4 @@
-# Rust Actix-web + SQLite API
+# Rust Actix-web + MySQL API
 
 Endpoints (PL):
 
@@ -15,11 +15,11 @@ Endpoints (PL):
 
 ## Uruchomienie (Windows PowerShell)
 
-Wymagany Rust (cargo). W katalogu `rust-api/`:
+Wymagany Rust (cargo) oraz serwer MySQL. W katalogu `rust-api/`:
 
 ```powershell
-# (opcjonalnie) ustaw ścieżkę bazy
-$env:DB_PATH = "app.db"
+# (ustaw adres bazy; przykład lokalnie z bazą 'angflow')
+$env:MYSQL_URL = "mysql://root@127.0.0.1:3306/angflow"
 # (opcjonalnie) własny sekret JWT
 # $env:JWT_SECRET = "super_tajny_klucz"
 
@@ -29,5 +29,5 @@ cargo run
 Serwer wystartuje domyślnie na http://127.0.0.1:8080.
 
 ## Uwagi
-- Baza SQLite i tabele są tworzone automatycznie przy starcie (seed kilku produktów + kod PROMO10).
+- Baza MySQL i tabele są tworzone automatycznie przy starcie na podstawie pliku `sql/init.sql` (seed kilku produktów + kod PROMO10). Jeśli baza z `MYSQL_URL` nie istnieje, aplikacja spróbuje ją utworzyć.
 - Token JWT ważny 7 dni. Do żądań wymagających autoryzacji dodaj nagłówek: `Authorization: Bearer <token>`.

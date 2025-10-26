@@ -6,16 +6,15 @@ use dotenvy::dotenv;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{mysql::MySqlPoolOptions, Row, MySqlPool};
 use std::{env, future::Future, pin::Pin};
-use std::path::Path;
 use std::fs;
 use thiserror::Error;
 use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
-    pool: SqlitePool,
+    pool: MySqlPool,
     jwt_encoding: EncodingKey,
     jwt_decoding: DecodingKey,
 }
@@ -118,7 +117,7 @@ async fn register(data: web::Data<AppState>, body: web::Json<LoginRequest>) -> R
         .await;
     match res {
         Ok(done) => {
-            let user_id = done.last_insert_rowid();
+            let user_id = done.last_insert_id() as i64;
             tx.commit().await.map_err(|_| ApiError::Server)?;
             let token = make_jwt(user_id, &data);
             Ok(web::Json(TokenResponse { token }))
@@ -168,7 +167,7 @@ async fn logout(data: web::Data<AppState>, req: HttpRequest, _user: AuthUser) ->
     let data_claims = decode::<Claims>(token, &data.jwt_decoding, &Validation::new(Algorithm::HS256))
         .map_err(|_| ApiError::BadRequest("Nieprawidłowy token".into()))?;
     let exp = data_claims.claims.exp as i64;
-    sqlx::query("INSERT OR IGNORE INTO revoked_tokens(token, exp) VALUES(?, ?)")
+    sqlx::query("INSERT IGNORE INTO revoked_tokens(token, exp) VALUES(?, ?)")
         .bind(token)
         .bind(exp)
         .execute(&data.pool)
@@ -353,7 +352,7 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
         .execute(&mut *tx)
         .await
         .map_err(|_| ApiError::Server)?;
-    let order_id = res.last_insert_rowid();
+    let order_id = res.last_insert_id() as i64;
 
     // wstaw pozycje i zdejmij stany
     let mut outputs: Vec<OrderItemOutput> = Vec::new();
@@ -394,7 +393,7 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
     Ok(web::Json(resp))
 }
 
-async fn get_discount(pool: &SqlitePool, code: &str) -> Result<Option<(i64, bool)>, ApiError> {
+async fn get_discount(pool: &MySqlPool, code: &str) -> Result<Option<(i64, bool)>, ApiError> {
     let row = sqlx::query("SELECT percentage, active FROM discount_codes WHERE code = ?")
         .bind(code)
         .fetch_optional(pool)
@@ -521,80 +520,25 @@ async fn cancel_order(data: web::Data<AppState>, user: AuthUser, path: web::Path
     Ok(web::Json(serde_json::json!({"status":"canceled"})))
 }
 
-async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    // enable foreign keys
-    sqlx::query("PRAGMA foreign_keys = ON;").execute(pool).await?;
-
-    // create tables
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            login TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL
-        );
-        
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            price_cents INTEGER NOT NULL,
-            stock INTEGER NOT NULL DEFAULT 0,
-            details TEXT NOT NULL DEFAULT '',
-            storage TEXT NOT NULL DEFAULT '',
-            ingredients TEXT NOT NULL DEFAULT ''
-        );
-
-        CREATE TABLE IF NOT EXISTS discount_codes (
-            code TEXT PRIMARY KEY,
-            percentage INTEGER NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1
-        );
-
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            total_cents INTEGER NOT NULL,
-            total_items INTEGER NOT NULL,
-            first_name TEXT NOT NULL,
-            last_name TEXT NOT NULL,
-            city TEXT NOT NULL,
-            postal_code TEXT NOT NULL,
-            address TEXT NOT NULL,
-            promo_code TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS order_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id INTEGER NOT NULL,
-            product_id INTEGER NOT NULL,
-            quantity INTEGER NOT NULL,
-            price_cents INTEGER NOT NULL,
-            FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE,
-            FOREIGN KEY(product_id) REFERENCES products(id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS revoked_tokens (
-            token TEXT PRIMARY KEY,
-            exp INTEGER NOT NULL
-        );
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // seed products if none
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) as cnt FROM products")
+async fn init_db(pool: &MySqlPool) -> Result<(), sqlx::Error> {
+    let script = fs::read_to_string("sql/init.sql").map_err(sqlx::Error::Io)?;
+    for stmt in script.split(';') {
+        let s = stmt.trim();
+        if s.is_empty() || s.starts_with("--") { continue; }
+        if let Err(e) = sqlx::query(s).execute(pool).await {
+            eprintln!("[WARN] Nie udało się wykonać polecenia SQL: {} => {}", s.chars().take(80).collect::<String>(), e);
+        }
+    }
+    // Fallback seed: jeśli produktów brak, dodaj przykładowe
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM products")
         .fetch_one(pool)
         .await?;
     if count == 0 {
         let mut tx = pool.begin().await?;
         let samples = vec![
-            ("Chleb pszenny", 599, 50, "Świeże pieczywo.", "Przechowywać w suchym miejscu.", "mąka, drożdże, sól"),
-            ("Masło ekstra", 1299, 30, "Masło 82%.", "Przechowywać w lodówce.", "śmietanka, kultury bakterii"),
-            ("Ser żółty", 1899, 20, "Ser dojrzewający.", "Przechowywać w lodówce.", "mleko, sól, podpuszczka"),
+            ("Chleb pszenny", 599_i64, 50_i64, "Świeże pieczywo.", "Przechowywać w suchym miejscu.", "mąka, drożdże, sól"),
+            ("Masło ekstra", 1299_i64, 30_i64, "Masło 82%.", "Przechowywać w lodówce.", "śmietanka, kultury bakterii"),
+            ("Ser żółty", 1899_i64, 20_i64, "Ser dojrzewający.", "Przechowywać w lodówce.", "mleko, sól, podpuszczka"),
         ];
         for (name, price, stock, details, storage, ingredients) in samples {
             sqlx::query("INSERT INTO products(name, price_cents, stock, details, storage, ingredients) VALUES(?, ?, ?, ?, ?, ?)")
@@ -607,13 +551,11 @@ async fn init_db(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                 .execute(&mut *tx)
                 .await?;
         }
-        // sample discount
-        sqlx::query("INSERT OR IGNORE INTO discount_codes(code, percentage, active) VALUES('PROMO10', 10, 1)")
+        sqlx::query("INSERT IGNORE INTO discount_codes(code, percentage, active) VALUES('PROMO10', 10, 1)")
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
     }
-
     Ok(())
 }
 
@@ -622,14 +564,15 @@ async fn main() -> std::io::Result<()> {
     dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     
-    let db_url = prepare_sqlite_url_and_ensure_file();
+    let db_url = std::env::var("MYSQL_URL").or_else(|_| std::env::var("DATABASE_URL")).unwrap_or_else(|_| "mysql://root@127.0.0.1:3306/angflow".to_string());
+    ensure_mysql_database(&db_url).await;
     println!("Używam bazy danych: {}", db_url);
 
-    let pool = SqlitePoolOptions::new()
+    let pool = MySqlPoolOptions::new()
         .max_connections(5)
         .connect(&db_url)
         .await
-        .expect("Nie udało się połączyć z SQLite");
+        .expect("Nie udało się połączyć z MySQL");
 
     init_db(&pool).await.expect("Inicjalizacja bazy nie powiodła się");
 
@@ -672,32 +615,22 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-fn prepare_sqlite_url_and_ensure_file() -> String {
-    // Obsłuż przypadki pamięci i pełnego URL
-    if let Ok(raw) = env::var("DB_PATH") {
-        if raw == ":memory:" || raw == "sqlite::memory:" { return "sqlite::memory:".to_string(); }
-        if raw.starts_with("sqlite:") { return raw; }
-        ensure_parent_and_file(&raw);
-        return format!("sqlite:{}", raw);
-    }
-    // Domyślnie użyj lokalnego pliku app.db i utwórz go jeśli nie istnieje
-    let default_path = "app.db".to_string();
-    ensure_parent_and_file(&default_path);
-    format!("sqlite:{}", default_path)
-}
-
-fn ensure_parent_and_file(path_str: &str) {
-    let path = Path::new(path_str);
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("[WARN] Nie udało się utworzyć katalogu dla bazy: {}", e);
+async fn ensure_mysql_database(url: &str) {
+    if let Some(idx) = url.rfind('/') {
+        let after = &url[idx+1..];
+        let db_name = after.split('?').next().unwrap_or("");
+        if !db_name.is_empty() {
+            let base = &url[..idx];
+            let admin_url = format!("{}/mysql", base);
+            match MySqlPoolOptions::new().max_connections(1).connect(&admin_url).await {
+                Ok(admin_pool) => {
+                    let stmt = format!("CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", db_name);
+                    if let Err(e) = sqlx::query(&stmt).execute(&admin_pool).await {
+                        eprintln!("[WARN] Nie udało się utworzyć bazy '{}': {}", db_name, e);
+                    }
+                }
+                Err(e) => eprintln!("[WARN] Nie udało się połączyć do serwera MySQL pod {} aby utworzyć bazę {}: {}", admin_url, db_name, e),
             }
-        }
-    }
-    if !path.exists() {
-        if let Err(e) = fs::File::create(path) {
-            eprintln!("[WARN] Nie udało się utworzyć pliku bazy: {}", e);
         }
     }
 }
