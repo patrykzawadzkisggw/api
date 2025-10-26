@@ -1,5 +1,5 @@
 use actix_cors::Cors;
-use actix_web::{dev::Payload, error::ErrorUnauthorized, get, http::header, middleware::Logger, post, web, App, Error as ActixError, FromRequest, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web::{dev::Payload, error::ErrorUnauthorized, get, http::header, post, web, App, Error as ActixError, FromRequest, HttpRequest, HttpResponse, HttpServer, Responder};
 use argon2::{password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString}, Argon2};
 use chrono::Utc;
 use dotenvy::dotenv;
@@ -10,6 +10,7 @@ use sqlx::{mysql::MySqlPoolOptions, Row, MySqlPool};
 use std::{env, future::Future, pin::Pin};
 use std::fs;
 use thiserror::Error;
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -521,7 +522,7 @@ async fn cancel_order(data: web::Data<AppState>, user: AuthUser, path: web::Path
 }
 
 async fn init_db(pool: &MySqlPool) -> Result<(), sqlx::Error> {
-    let script = fs::read_to_string("sql/init.sql").map_err(sqlx::Error::Io)?;
+    let script = fs::read_to_string("/home/patryk/rust-api/sql/init.sql").map_err(sqlx::Error::Io)?;
     for stmt in script.split(';') {
         let s = stmt.trim();
         if s.is_empty() || s.starts_with("--") { continue; }
@@ -539,11 +540,7 @@ async fn main() -> std::io::Result<()> {
     ensure_mysql_database(&db_url).await;
     println!("Używam bazy danych: {}", db_url);
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url)
-        .await
-        .expect("Nie udało się połączyć z MySQL");
+    let pool = wait_for_mysql_and_connect(&db_url).await;
 
     init_db(&pool).await.expect("Inicjalizacja bazy nie powiodła się");
 
@@ -567,7 +564,6 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         let cors = Cors::permissive();
         App::new()
-            .wrap(Logger::default())
             .wrap(cors)
             .app_data(state.clone())
             .service(register)
@@ -601,6 +597,37 @@ async fn ensure_mysql_database(url: &str) {
                     }
                 }
                 Err(e) => eprintln!("[WARN] Nie udało się połączyć do serwera MySQL pod {} aby utworzyć bazę {}: {}", admin_url, db_name, e),
+            }
+        }
+    }
+}
+
+async fn wait_for_mysql_and_connect(url: &str) -> MySqlPool {
+    // Nieskończone próby z narastającym backoffem (1s..10s)
+    let mut attempt: u32 = 0;
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        attempt += 1;
+        // Spróbuj utworzyć bazę (idempotentnie); jeśli serwer nie wstał, to się nie uda i spróbujemy ponownie
+        ensure_mysql_database(url).await;
+        match MySqlPoolOptions::new().max_connections(5).connect(url).await {
+            Ok(pool) => {
+                if attempt > 1 {
+                    println!("Połączono z MySQL po {} próbach.", attempt);
+                }
+                return pool;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[INFO] Baza niegotowa lub niedostępna (próba {}): {}. Ponawiam za {}s...",
+                    attempt,
+                    e,
+                    backoff.as_secs()
+                );
+                sleep(backoff).await;
+                if backoff < Duration::from_secs(10) {
+                    backoff += Duration::from_secs(1);
+                }
             }
         }
     }
