@@ -610,7 +610,7 @@ async fn wait_for_mysql_and_connect(url: &str) -> MySqlPool {
         attempt += 1;
         // Spróbuj utworzyć bazę (idempotentnie); jeśli serwer nie wstał, to się nie uda i spróbujemy ponownie
         ensure_mysql_database(url).await;
-        match MySqlPoolOptions::new().max_connections(5).connect(url).await {
+        match MySqlPoolOptions::new().max_connections(30).connect(url).await {
             Ok(pool) => {
                 if attempt > 1 {
                     println!("Połączono z MySQL po {} próbach.", attempt);
