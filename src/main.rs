@@ -525,36 +525,7 @@ async fn init_db(pool: &MySqlPool) -> Result<(), sqlx::Error> {
     for stmt in script.split(';') {
         let s = stmt.trim();
         if s.is_empty() || s.starts_with("--") { continue; }
-        if let Err(e) = sqlx::query(s).execute(pool).await {
-            eprintln!("[WARN] Nie udało się wykonać polecenia SQL: {} => {}", s.chars().take(80).collect::<String>(), e);
-        }
-    }
-    // Fallback seed: jeśli produktów brak, dodaj przykładowe
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM products")
-        .fetch_one(pool)
-        .await?;
-    if count == 0 {
-        let mut tx = pool.begin().await?;
-        let samples = vec![
-            ("Chleb pszenny", 599_i64, 50_i64, "Świeże pieczywo.", "Przechowywać w suchym miejscu.", "mąka, drożdże, sól"),
-            ("Masło ekstra", 1299_i64, 30_i64, "Masło 82%.", "Przechowywać w lodówce.", "śmietanka, kultury bakterii"),
-            ("Ser żółty", 1899_i64, 20_i64, "Ser dojrzewający.", "Przechowywać w lodówce.", "mleko, sól, podpuszczka"),
-        ];
-        for (name, price, stock, details, storage, ingredients) in samples {
-            sqlx::query("INSERT INTO products(name, price_cents, stock, details, storage, ingredients) VALUES(?, ?, ?, ?, ?, ?)")
-                .bind(name)
-                .bind(price)
-                .bind(stock)
-                .bind(details)
-                .bind(storage)
-                .bind(ingredients)
-                .execute(&mut *tx)
-                .await?;
-        }
-        sqlx::query("INSERT IGNORE INTO discount_codes(code, percentage, active) VALUES('PROMO10', 10, 1)")
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
+        sqlx::query(s).execute(pool).await?;
     }
     Ok(())
 }
@@ -564,7 +535,7 @@ async fn main() -> std::io::Result<()> {
     dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     
-    let db_url = std::env::var("MYSQL_URL").or_else(|_| std::env::var("DATABASE_URL")).unwrap_or_else(|_| "mysql://root@127.0.0.1:3306/angflow".to_string());
+    let db_url = std::env::var("MYSQL_URL").or_else(|_| std::env::var("DATABASE_URL")).unwrap_or_else(|_| "mysql://angflow_admin:TwojeHaslo123!@127.0.0.1:3306/angflow".to_string());
     ensure_mysql_database(&db_url).await;
     println!("Używam bazy danych: {}", db_url);
 
