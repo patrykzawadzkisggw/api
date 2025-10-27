@@ -15,7 +15,8 @@ use thiserror::Error;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 // TLS
-use rustls::{Certificate, PrivateKey, ServerConfig};
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 
 #[derive(Clone)]
@@ -657,18 +658,15 @@ fn load_rustls_config() -> io::Result<ServerConfig> {
 
     // Read certificate chain
     let mut cert_reader = BufReader::new(File::open(&cert_path)?);
-    let cert_chain: Vec<Certificate> = certs(&mut cert_reader)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Nieprawidłowy plik certyfikatu (PEM)"))?
-        .into_iter()
-        .map(Certificate)
-        .collect();
+    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Nieprawidłowy plik certyfikatu (PEM)"))?;
     if cert_chain.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Plik certyfikatu nie zawiera żadnych certyfikatów"));
     }
 
     // Read private key (try PKCS#8 first, then RSA PKCS#1)
     let mut key_reader = BufReader::new(File::open(&key_path)?);
-    let mut keys = pkcs8_private_keys(&mut key_reader)
+    let mut keys: Vec<PrivateKeyDer<'static>> = pkcs8_private_keys(&mut key_reader)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Nieprawidłowy klucz prywatny (PKCS#8)"))?;
     if keys.is_empty() {
         // Re-open and try RSA keys
@@ -679,11 +677,10 @@ fn load_rustls_config() -> io::Result<ServerConfig> {
     if keys.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Nie znaleziono klucza prywatnego w pliku"));
     }
-    let key = PrivateKey(keys.remove(0));
+    let key = keys.remove(0);
 
     // Build rustls server config
     let config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Błąd konfiguracji TLS: {}", e)))?;
