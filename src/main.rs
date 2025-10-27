@@ -659,6 +659,7 @@ fn load_rustls_config() -> io::Result<ServerConfig> {
     // Read certificate chain
     let mut cert_reader = BufReader::new(File::open(&cert_path)?);
     let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Nieprawidłowy plik certyfikatu (PEM)"))?;
     if cert_chain.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Plik certyfikatu nie zawiera żadnych certyfikatów"));
@@ -667,11 +668,15 @@ fn load_rustls_config() -> io::Result<ServerConfig> {
     // Read private key (try PKCS#8 first, then RSA PKCS#1)
     let mut key_reader = BufReader::new(File::open(&key_path)?);
     let mut keys: Vec<PrivateKeyDer<'static>> = pkcs8_private_keys(&mut key_reader)
+        .map(|r| r.map(Into::into))
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Nieprawidłowy klucz prywatny (PKCS#8)"))?;
     if keys.is_empty() {
         // Re-open and try RSA keys
         let mut key_reader = BufReader::new(File::open(&key_path)?);
         keys = rsa_private_keys(&mut key_reader)
+            .map(|r| r.map(Into::into))
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Nieprawidłowy klucz prywatny (RSA)"))?;
     }
     if keys.is_empty() {
