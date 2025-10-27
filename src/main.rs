@@ -9,9 +9,14 @@ use serde::{Deserialize, Serialize};
 use sqlx::{mysql::MySqlPoolOptions, Row, MySqlPool};
 use std::{env, future::Future, pin::Pin};
 use std::fs;
+use std::fs::File;
+use std::io::{self, BufReader};
 use thiserror::Error;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
+// TLS
+use rustls::{Certificate, PrivateKey, ServerConfig};
+use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 
 #[derive(Clone)]
 struct AppState {
@@ -559,9 +564,9 @@ async fn main() -> std::io::Result<()> {
     let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into());
     let port: u16 = env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
 
-    println!("Serwer startuje na http://{}:{}", host, port);
+    println!("Serwer startuje na porcie {} (HTTP/HTTPS zależnie od konfiguracji)", port);
 
-    HttpServer::new(move || {
+    let server_factory = move || {
         let cors = Cors::permissive();
         App::new()
             .wrap(cors)
@@ -576,10 +581,20 @@ async fn main() -> std::io::Result<()> {
             .service(get_order)
             .service(discount_check)
             .service(cancel_order)
-    })
-    .bind((host, port))?
-    .run()
-    .await
+    };
+
+    let mut server = HttpServer::new(server_factory);
+    match load_rustls_config() {
+        Ok(tls_config) => {
+            println!("HTTPS włączony. Nasłuch na https://{}:{}", host, port);
+            server = server.bind_rustls_0_22((host.as_str(), port), tls_config)?;
+        }
+        Err(e) => {
+            eprintln!("[WARN] TLS wyłączony ({}). Nasłuch na http://{}:{}", e, host, port);
+            server = server.bind((host.as_str(), port))?;
+        }
+    }
+    server.run().await
 }
 
 async fn ensure_mysql_database(url: &str) {
@@ -631,4 +646,46 @@ async fn wait_for_mysql_and_connect(url: &str) -> MySqlPool {
             }
         }
     }
+}
+
+fn load_rustls_config() -> io::Result<ServerConfig> {
+    // Allow overriding paths via env; default to Let's Encrypt paths provided by the user
+    let cert_path = env::var("TLS_CERT_PATH")
+        .unwrap_or_else(|_| "/etc/letsencrypt/live/securebox.hopto.org/fullchain.pem".to_string());
+    let key_path = env::var("TLS_KEY_PATH")
+        .unwrap_or_else(|_| "/etc/letsencrypt/live/securebox.hopto.org/privkey.pem".to_string());
+
+    // Read certificate chain
+    let mut cert_reader = BufReader::new(File::open(&cert_path)?);
+    let cert_chain: Vec<Certificate> = certs(&mut cert_reader)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Nieprawidłowy plik certyfikatu (PEM)"))?
+        .into_iter()
+        .map(Certificate)
+        .collect();
+    if cert_chain.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Plik certyfikatu nie zawiera żadnych certyfikatów"));
+    }
+
+    // Read private key (try PKCS#8 first, then RSA PKCS#1)
+    let mut key_reader = BufReader::new(File::open(&key_path)?);
+    let mut keys = pkcs8_private_keys(&mut key_reader)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Nieprawidłowy klucz prywatny (PKCS#8)"))?;
+    if keys.is_empty() {
+        // Re-open and try RSA keys
+        let mut key_reader = BufReader::new(File::open(&key_path)?);
+        keys = rsa_private_keys(&mut key_reader)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Nieprawidłowy klucz prywatny (RSA)"))?;
+    }
+    if keys.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Nie znaleziono klucza prywatnego w pliku"));
+    }
+    let key = PrivateKey(keys.remove(0));
+
+    // Build rustls server config
+    let config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Błąd konfiguracji TLS: {}", e)))?;
+    Ok(config)
 }

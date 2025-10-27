@@ -28,6 +28,22 @@ cargo run
 
 Serwer wystartuje domyślnie na http://127.0.0.1:8080.
 
+## HTTPS (Let's Encrypt)
+
+Aplikacja może działać po HTTPS na tym samym porcie 8080. Domyślnie szuka certyfikatu w ścieżkach:
+
+- Certyfikat (chain): `/etc/letsencrypt/live/securebox.hopto.org/fullchain.pem`
+- Klucz prywatny: `/etc/letsencrypt/live/securebox.hopto.org/privkey.pem`
+
+Możesz je zmienić zmiennymi środowiskowymi:
+
+```powershell
+$env:TLS_CERT_PATH = "/etc/letsencrypt/live/securebox.hopto.org/fullchain.pem"
+$env:TLS_KEY_PATH  = "/etc/letsencrypt/live/securebox.hopto.org/privkey.pem"
+```
+
+Jeśli pliki nie są dostępne lub niepoprawne, aplikacja automatycznie uruchomi się po HTTP na porcie 8080. Gdy certyfikaty są dostępne, serwer nasłuchuje pod adresem `https://host:8080`.
+
 ## Uwagi
 - Baza MySQL i tabele są tworzone automatycznie przy starcie na podstawie pliku `sql/init.sql` (seed kilku produktów + kod PROMO10). Jeśli baza z `MYSQL_URL` nie istnieje, aplikacja spróbuje ją utworzyć.
 - Token JWT ważny 7 dni. Do żądań wymagających autoryzacji dodaj nagłówek: `Authorization: Bearer <token>`.
