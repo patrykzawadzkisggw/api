@@ -103,9 +103,10 @@ struct TokenResponse { token: String }
 #[post("/api/register")]
 async fn register(data: web::Data<AppState>, body: web::Json<LoginRequest>) -> Result<impl Responder, ApiError> {
     let LoginRequest { login: user_login, password } = body.into_inner();
-    if user_login.trim().is_empty() {
-        return Err(ApiError::BadRequest("Login jest wymagany".into()));
-    }
+    let user_login = match validate_login(&user_login) {
+        Ok(l) => l,
+        Err(msg) => return Err(ApiError::BadRequest(msg)),
+    };
     if let Err(msg) = validate_password(&password) {
         return Err(ApiError::BadRequest(msg));
     }
@@ -130,8 +131,15 @@ async fn register(data: web::Data<AppState>, body: web::Json<LoginRequest>) -> R
             Ok(web::Json(TokenResponse { token }))
         }
         Err(e) => {
-            let msg = if let sqlx::Error::Database(db) = &e { if db.message().contains("UNIQUE") { "Użytkownik już istnieje".into() } else { format!("Błąd bazy: {}", db.message()) } } else { "Błąd bazy".into() };
-            Err(ApiError::BadRequest(msg))
+            if let sqlx::Error::Database(db) = &e {
+                // MySQL duplicate entry error code is 1062
+                if db.code().map(|c| c == "1062").unwrap_or(false) || db.message().contains("Duplicate entry") {
+                    return Err(ApiError::BadRequest("Login niedostępny".into()));
+                } else {
+                    return Err(ApiError::BadRequest(format!("Błąd bazy: {}", db.message())));
+                }
+            }
+            Err(ApiError::Server)
         }
     }
 }
@@ -139,6 +147,10 @@ async fn register(data: web::Data<AppState>, body: web::Json<LoginRequest>) -> R
 #[post("/api/login")]
 async fn login(data: web::Data<AppState>, body: web::Json<LoginRequest>) -> Result<impl Responder, ApiError> {
     let LoginRequest { login: user_login, password } = body.into_inner();
+    let user_login = match validate_login(&user_login) {
+        Ok(l) => l,
+        Err(msg) => return Err(ApiError::BadRequest(msg)),
+    };
     let rec = sqlx::query("SELECT id, password_hash FROM users WHERE login = ?")
         .bind(&user_login)
         .fetch_optional(&data.pool)
@@ -157,6 +169,17 @@ async fn login(data: web::Data<AppState>, body: web::Json<LoginRequest>) -> Resu
         }
     }
     Err(ApiError::BadRequest("Nieprawidłowy login lub hasło".into()))
+}
+
+fn validate_login(login: &str) -> Result<String, String> {
+    let s = login.trim();
+    if s.is_empty() {
+        return Err("Login jest wymagany".into());
+    }
+    if s.chars().any(|c| c.is_whitespace()) {
+        return Err("Login nie może zawierać spacji".into());
+    }
+    Ok(s.to_string())
 }
 
 #[post("/api/logout")]
@@ -467,6 +490,30 @@ async fn get_order(data: web::Data<AppState>, user: AuthUser, path: web::Path<i6
     Ok(web::Json(resp))
 }
 
+#[get("/api/orders/{id}/status")]
+async fn order_status(data: web::Data<AppState>, user: AuthUser, path: web::Path<i64>) -> Result<impl Responder, ApiError> {
+    let id = path.into_inner();
+    // Only allow user to query their own orders; if not found or not owned, respond as 'not found' per spec
+    let row = sqlx::query("SELECT status FROM orders WHERE id = ? AND user_id = ?")
+        .bind(id)
+        .bind(user.0)
+        .fetch_optional(&data.pool)
+        .await
+        .map_err(|_| ApiError::Server)?;
+
+    if let Some(r) = row {
+        let status: String = r.get("status");
+        if status == "canceled" {
+            return Ok(web::Json(serde_json::json!({"message":"zamowienie anulowane","image":"canceled.png"})));
+        } else {
+            return Ok(web::Json(serde_json::json!({"message":"zamowienie zlozono","image":"placed.png"})));
+        }
+    }
+
+    // Not found (either doesn't exist or belongs to another user)
+    Ok(web::Json(serde_json::json!({"message":"nie udalo sie zlozyc zamowienia","image":"failed.png"})))
+}
+
 #[derive(Debug, Deserialize)]
 struct DiscountCheck { code: String }
 
@@ -580,6 +627,7 @@ async fn main() -> std::io::Result<()> {
             .service(create_order)
             .service(list_orders)
             .service(get_order)
+            .service(order_status)
             .service(discount_check)
             .service(cancel_order)
     };
