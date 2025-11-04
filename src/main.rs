@@ -171,15 +171,15 @@ async fn login(data: web::Data<AppState>, body: web::Json<LoginRequest>) -> Resu
     Err(ApiError::BadRequest("Nieprawidłowy login lub hasło".into()))
 }
 
-fn validate_login(login: &str) -> Result<String, String> {
-    let s = login.trim();
-    if s.is_empty() {
+fn validate_login(s: &str) -> Result<String, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
         return Err("Login jest wymagany".into());
     }
-    if s.chars().any(|c| c.is_whitespace()) {
+    if trimmed.chars().any(|c| c.is_whitespace()) {
         return Err("Login nie może zawierać spacji".into());
     }
-    Ok(s.to_string())
+    Ok(trimmed.to_string())
 }
 
 #[post("/api/logout")]
