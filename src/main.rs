@@ -83,6 +83,8 @@ enum ApiError {
     BadRequest(String),
     #[error("Błąd serwera")] 
     Server,
+    #[error("Błędne żądanie (JSON)")]
+    BadRequestJson(serde_json::Value),
 }
 
 impl actix_web::ResponseError for ApiError {
@@ -91,6 +93,7 @@ impl actix_web::ResponseError for ApiError {
             ApiError::NotFound => HttpResponse::NotFound().json(serde_json::json!({"error":"not_found"})),
             ApiError::BadRequest(msg) => HttpResponse::BadRequest().json(serde_json::json!({"error":msg})),
             ApiError::Server => HttpResponse::InternalServerError().json(serde_json::json!({"error":"server_error"})),
+            ApiError::BadRequestJson(v) => HttpResponse::BadRequest().json(v),
         }
     }
 }
@@ -326,6 +329,9 @@ struct CreateOrderResponse {
 #[derive(Debug, Serialize)]
 struct OrderItemOutput { product_id: i64, name: String, quantity: i64, price_cents: i64 }
 
+#[derive(Debug, Serialize)]
+struct StockShortage { product_id: i64, available: i64, missing: i64 }
+
 #[post("/api/orders")]
 async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json<CreateOrderRequest>) -> Result<impl Responder, ApiError> {
     let mut tx = data.pool.begin().await.map_err(|_| ApiError::Server)?;
@@ -346,21 +352,45 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
     let mut total_cents: i64 = 0;
     let mut total_items: i64 = 0;
     let mut resolved_items: Vec<(OrderItemInput, String, i64)> = Vec::new();
+    // Zbieranie błędów w formie listy dla frontendu
+    let mut products_not_found: Vec<i64> = Vec::new();
+    let mut insufficient_stock: Vec<StockShortage> = Vec::new();
     for it in &req.items {
-        let row = sqlx::query("SELECT name, price_cents, stock FROM products WHERE id = ?")
+        if it.quantity <= 0 { return Err(ApiError::BadRequest("Ilość musi być > 0".into())); }
+
+        let row_opt = sqlx::query("SELECT name, price_cents, stock FROM products WHERE id = ?")
             .bind(it.product_id)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|_| ApiError::Server)?
-            .ok_or_else(|| ApiError::BadRequest(format!("Produkt o id {} nie istnieje", it.product_id)))?;
+            .map_err(|_| ApiError::Server)?;
+
+        let Some(row) = row_opt else {
+            products_not_found.push(it.product_id);
+            continue;
+        };
+
         let name: String = row.get("name");
         let price_cents: i64 = row.get("price_cents");
         let stock: i64 = row.get("stock");
-        if it.quantity <= 0 { return Err(ApiError::BadRequest("Ilość musi być > 0".into())); }
-        if stock < it.quantity { return Err(ApiError::BadRequest(format!("Brak na stanie produktu {}", name))); }
+        if stock < it.quantity {
+            insufficient_stock.push(StockShortage { product_id: it.product_id, available: stock, missing: it.quantity - stock });
+            continue;
+        }
         total_cents += price_cents * it.quantity;
         total_items += it.quantity;
         resolved_items.push((OrderItemInput{ product_id: it.product_id, quantity: it.quantity }, name, price_cents));
+    }
+
+    if !products_not_found.is_empty() || !insufficient_stock.is_empty() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("error".into(), serde_json::Value::String("invalid_order".into()));
+        if !products_not_found.is_empty() {
+            obj.insert("products_not_found".into(), serde_json::json!(products_not_found));
+        }
+        if !insufficient_stock.is_empty() {
+            obj.insert("insufficient_stock".into(), serde_json::json!(insufficient_stock));
+        }
+        return Err(ApiError::BadRequestJson(serde_json::Value::Object(obj)));
     }
 
     // apply discount
