@@ -235,6 +235,68 @@ fn validate_password(pwd: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn is_valid_postal_code(s: &str) -> bool {
+    let t = s.trim();
+    if t.len() != 6 { return false; }
+    let bytes = t.as_bytes();
+    if bytes[2] != b'-' { return false; }
+    bytes[0].is_ascii_digit() && bytes[1].is_ascii_digit() && bytes[3].is_ascii_digit() && bytes[4].is_ascii_digit() && bytes[5].is_ascii_digit()
+}
+
+fn contains_digit(s: &str) -> bool {
+    s.chars().any(|c| c.is_ascii_digit())
+}
+
+fn validate_order_fields(req: &CreateOrderRequest) -> Option<serde_json::Value> {
+    let mut contact = serde_json::Map::new();
+    let mut field_errors = serde_json::Map::new();
+
+    let first = req.first_name.trim();
+    if first.is_empty() || first.len() < 2 {
+        contact.insert("first_name".into(), serde_json::Value::String("Imię jest wymagane (min. 2 znaki)".into()));
+    } else if contains_digit(first) {
+        contact.insert("first_name".into(), serde_json::Value::String("Imię nie może zawierać cyfr".into()));
+    }
+
+    let last = req.last_name.trim();
+    if last.is_empty() || last.len() < 2 {
+        contact.insert("last_name".into(), serde_json::Value::String("Nazwisko jest wymagane (min. 2 znaki)".into()));
+    } else if contains_digit(last) {
+        contact.insert("last_name".into(), serde_json::Value::String("Nazwisko nie może zawierać cyfr".into()));
+    }
+
+    let city = req.city.trim();
+    if city.is_empty() {
+        field_errors.insert("city".into(), serde_json::Value::String("Miasto jest wymagane".into()));
+    } else if contains_digit(city) {
+        field_errors.insert("city".into(), serde_json::Value::String("Miasto nie może zawierać cyfr".into()));
+    }
+
+    let addr = req.address.trim();
+    if addr.is_empty() || addr.len() < 5 {
+        field_errors.insert("address".into(), serde_json::Value::String("Ulica i numer są wymagane (min. 5 znaków)".into()));
+    }
+
+    let postal = req.postal_code.trim();
+    if !is_valid_postal_code(postal) {
+        field_errors.insert("postal_code".into(), serde_json::Value::String("Nieprawidłowy kod pocztowy (format DD-DDD)".into()));
+    }
+
+    if contact.is_empty() && field_errors.is_empty() {
+        None
+    } else {
+        let mut obj = serde_json::Map::new();
+        obj.insert("error".into(), serde_json::Value::String("invalid_order".into()));
+        if !contact.is_empty() {
+            obj.insert("contactFormErrors".into(), serde_json::Value::Object(contact));
+        }
+        if !field_errors.is_empty() {
+            obj.insert("fieldErrors".into(), serde_json::Value::Object(field_errors));
+        }
+        Some(serde_json::Value::Object(obj))
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ProductListItem { id: i64, name: String, price_cents: i64 }
 
@@ -334,9 +396,15 @@ struct StockShortage { product_id: i64, available: i64, missing: i64 }
 
 #[post("/api/orders")]
 async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json<CreateOrderRequest>) -> Result<impl Responder, ApiError> {
-    let mut tx = data.pool.begin().await.map_err(|_| ApiError::Server)?;
     let req = body.into_inner();
     if req.items.is_empty() { return Err(ApiError::BadRequest("Lista produktów nie może być pusta".into())); }
+
+    // Validate contact/address fields before touching DB so frontend gets immediate structured feedback
+    if let Some(val) = validate_order_fields(&req) {
+        return Err(ApiError::BadRequestJson(val));
+    }
+
+    let mut tx = data.pool.begin().await.map_err(|_| ApiError::Server)?;
 
     // sprawdz promo code
     let mut discount_pct: i64 = 0;
