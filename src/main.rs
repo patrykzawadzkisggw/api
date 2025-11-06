@@ -531,7 +531,14 @@ async fn get_discount(pool: &MySqlPool, code: &str) -> Result<Option<(i64, bool)
 }
 
 #[derive(Debug, Serialize)]
-struct OrderListItem { id: i64, status: String, created_at: String, total_cents: i64, total_items: i64 }
+struct OrderListItem {
+    id: i64,
+    status: String,
+    created_at: String,
+    total_cents: i64,
+    total_items: i64,
+    images: Vec<String>,
+}
 
 #[get("/api/orders")]
 async fn list_orders(data: web::Data<AppState>, user: AuthUser) -> Result<impl Responder, ApiError> {
@@ -540,13 +547,34 @@ async fn list_orders(data: web::Data<AppState>, user: AuthUser) -> Result<impl R
         .fetch_all(&data.pool)
         .await
         .map_err(|_| ApiError::Server)?;
-    let list: Vec<OrderListItem> = rows.into_iter().map(|r| OrderListItem{
-        id: r.get("id"),
-        status: r.get("status"),
-        created_at: r.get("created_at"),
-        total_cents: r.get("total_cents"),
-        total_items: r.get("total_items"),
-    }).collect();
+    let list: Vec<OrderListItem> = rows
+        .into_iter()
+        .map(|r| {
+            let id: i64 = r.get("id");
+            let status_db: String = r.get("status");
+            let created_at: String = r.get("created_at");
+            let total_cents: i64 = r.get("total_cents");
+            let total_items: i64 = r.get("total_items");
+
+            let status = match status_db.as_str() {
+                "canceled" => "Anulowane".to_string(),
+                "delivered" | "completed" => "Dostarczone".to_string(),
+                _ => "W drodze".to_string(),
+            };
+
+            let count = if total_items < 0 { 0 } else { total_items as usize };
+            let images: Vec<String> = std::iter::repeat("orange.png".to_string()).take(count).collect();
+
+            OrderListItem {
+                id,
+                status,
+                created_at,
+                total_cents,
+                total_items,
+                images,
+            }
+        })
+        .collect();
     Ok(web::Json(list))
 }
 
