@@ -599,9 +599,17 @@ async fn get_order(data: web::Data<AppState>, user: AuthUser, path: web::Path<i6
         quantity: r.get("quantity"),
         price_cents: r.get("price_cents"),
     }).collect();
+    // Map DB status to the API-facing Polish statuses
+    let status_db: String = row.get("status");
+    let status = match status_db.as_str() {
+        "canceled" => "Anulowane".to_string(),
+        "delivered" | "completed" => "Dostarczone".to_string(),
+        _ => "W drodze".to_string(),
+    };
+
     let resp = CreateOrderResponse{
         id: row.get("id"),
-        status: row.get("status"),
+        status,
         created_at: row.get("created_at"),
         total_cents: row.get("total_cents"),
         total_items: row.get("total_items"),
