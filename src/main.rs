@@ -8,7 +8,6 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sqlx::{mysql::MySqlPoolOptions, Row, MySqlPool};
 use std::{env, future::Future, pin::Pin};
-use std::fs;
 use std::fs::File;
 use std::io::{self, BufReader};
 use thiserror::Error;
@@ -335,13 +334,16 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
     let list: Vec<ProductListItem> = rows
         .into_iter()
         .map(|r| {
-            // Parse images safely: JSON column may be returned as JSON value or string
-            let images: Vec<String> = match r.try_get::<Option<serde_json::Value>, _>("images") {
-                Ok(Some(val)) => match val {
-                    serde_json::Value::Array(arr) => arr.into_iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect(),
-                    serde_json::Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
-                    _ => Vec::new(),
-                },
+            // Parse images safely from a JSON string returned by MySQL driver
+            let images: Vec<String> = match r.try_get::<Option<String>, _>("images") {
+                Ok(Some(s)) => {
+                    // s is expected to be a JSON array like '["a.png","b.png"]'
+                    match serde_json::from_str::<serde_json::Value>(&s) {
+                        Ok(serde_json::Value::Array(arr)) => arr.into_iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect(),
+                        Ok(serde_json::Value::String(inner)) => serde_json::from_str(&inner).unwrap_or_default(),
+                        _ => Vec::new(),
+                    }
+                }
                 _ => Vec::new(),
             };
             let id: i64 = r.get("id");
@@ -375,10 +377,10 @@ async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Resu
         storage: row.get("storage"),
         ingredients: row.get("ingredients"),
         price_before_cents: row.get::<Option<i64>, _>("price_before_cents"),
-        images: match row.try_get::<Option<serde_json::Value>, _>("images") {
-            Ok(Some(val)) => match val {
-                serde_json::Value::Array(arr) => arr.into_iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect(),
-                serde_json::Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
+        images: match row.try_get::<Option<String>, _>("images") {
+            Ok(Some(s)) => match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(serde_json::Value::Array(arr)) => arr.into_iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect(),
+                Ok(serde_json::Value::String(inner)) => serde_json::from_str(&inner).unwrap_or_default(),
                 _ => Vec::new(),
             },
             _ => Vec::new(),
@@ -729,7 +731,7 @@ async fn cancel_order(data: web::Data<AppState>, user: AuthUser, path: web::Path
     Ok(web::Json(serde_json::json!({"status":"Anulowane"})))
 }
 
-async fn init_db(pool: &MySqlPool) -> Result<(), sqlx::Error> {
+async fn init_db(_pool: &MySqlPool) -> Result<(), sqlx::Error> {
     // Initialization from `sql/init.sql` is intentionally disabled.
     // If you want to run the SQL initialization from file again, uncomment the lines below
     // and adjust the path as needed for your environment.
