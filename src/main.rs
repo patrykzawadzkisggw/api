@@ -309,6 +309,7 @@ struct ProductDetail {
     details: String,
     storage: String,
     ingredients: String,
+    price_before_cents: Option<i64>
 }
 
 #[get("/api/products")]
@@ -367,6 +368,7 @@ async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Resu
         details: row.get("details"),
         storage: row.get("storage"),
         ingredients: row.get("ingredients"),
+        price_before_cents: row.get::<Option<i64>, _>("price_before_cents"),
     };
     Ok(web::Json(detail))
 }
