@@ -748,12 +748,15 @@ async fn cancel_order(data: web::Data<AppState>, user: AuthUser, path: web::Path
 }
 
 async fn init_db(pool: &MySqlPool) -> Result<(), sqlx::Error> {
-    let script = fs::read_to_string("/home/patryk/rust-api/sql/init.sql").map_err(sqlx::Error::Io)?;
-    for stmt in script.split(';') {
-        let s = stmt.trim();
-        if s.is_empty() || s.starts_with("--") { continue; }
-        sqlx::query(s).execute(pool).await?;
-    }
+    // Initialization from `sql/init.sql` is intentionally disabled.
+    // If you want to run the SQL initialization from file again, uncomment the lines below
+    // and adjust the path as needed for your environment.
+    // let script = fs::read_to_string("/home/patryk/rust-api/sql/init.sql").map_err(sqlx::Error::Io)?;
+    // for stmt in script.split(';') {
+    //     let s = stmt.trim();
+    //     if s.is_empty() || s.starts_with("--") { continue; }
+    //     sqlx::query(s).execute(pool).await?;
+    // }
     Ok(())
 }
 
@@ -768,7 +771,9 @@ async fn main() -> std::io::Result<()> {
 
     let pool = wait_for_mysql_and_connect(&db_url).await;
 
-    init_db(&pool).await.expect("Inicjalizacja bazy nie powiodła się");
+    // Initialize DB from `sql/init.sql` is currently disabled.
+    // To re-enable, uncomment the line below.
+    // init_db(&pool).await.expect("Inicjalizacja bazy nie powiodła się");
 
     let jwt_secret = env::var("JWT_SECRET").unwrap_or_else(|_| {
         let rand = Uuid::new_v4().to_string();
