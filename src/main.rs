@@ -466,7 +466,7 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
 
     // utworz zamowienie
     let now = Utc::now().to_rfc3339();
-    let res = sqlx::query("INSERT INTO orders(user_id, status, created_at, total_cents, total_items, first_name, last_name, city, postal_code, address, promo_code) VALUES(?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    let res = sqlx::query("INSERT INTO orders(user_id, status, created_at, total_cents, total_items, first_name, last_name, city, postal_code, address, promo_code) VALUES(?, 'W drodze', ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(user.0)
         .bind(&now)
         .bind(total_cents)
@@ -506,7 +506,7 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
 
     let resp = CreateOrderResponse{
         id: order_id,
-        status: "pending".into(),
+        status: "W drodze".into(),
         created_at: now,
         total_cents,
         total_items,
@@ -556,11 +556,8 @@ async fn list_orders(data: web::Data<AppState>, user: AuthUser) -> Result<impl R
             let total_cents: i64 = r.get("total_cents");
             let total_items: i64 = r.get("total_items");
 
-            let status = match status_db.as_str() {
-                "canceled" => "Anulowane".to_string(),
-                "delivered" | "completed" => "Dostarczone".to_string(),
-                _ => "W drodze".to_string(),
-            };
+            // Status is stored already in Polish; use it directly
+            let status = status_db;
 
             let count = if total_items < 0 { 0 } else { total_items as usize };
             let images: Vec<String> = std::iter::repeat("orange.png".to_string()).take(count).collect();
@@ -599,13 +596,8 @@ async fn get_order(data: web::Data<AppState>, user: AuthUser, path: web::Path<i6
         quantity: r.get("quantity"),
         price_cents: r.get("price_cents"),
     }).collect();
-    // Map DB status to the API-facing Polish statuses
-    let status_db: String = row.get("status");
-    let status = match status_db.as_str() {
-        "canceled" => "Anulowane".to_string(),
-        "delivered" | "completed" => "Dostarczone".to_string(),
-        _ => "W drodze".to_string(),
-    };
+    // Status is stored in Polish in the DB; use it directly
+    let status: String = row.get("status");
 
     let resp = CreateOrderResponse{
         id: row.get("id"),
@@ -637,7 +629,7 @@ async fn order_status(data: web::Data<AppState>, user: AuthUser, path: web::Path
 
     if let Some(r) = row {
         let status: String = r.get("status");
-        if status == "canceled" {
+        if status == "Anulowane" {
             return Ok(web::Json(serde_json::json!({"message":"zamowienie anulowane","image":"canceled.png"})));
         } else {
             return Ok(web::Json(serde_json::json!({"message":"zamowienie zlozono","image":"placed.png"})));
@@ -680,7 +672,7 @@ async fn cancel_order(data: web::Data<AppState>, user: AuthUser, path: web::Path
         .map_err(|_| ApiError::Server)?
         .ok_or(ApiError::NotFound)?;
     let status: String = row.get("status");
-    if status != "pending" { return Err(ApiError::BadRequest("Nie można anulować tego zamówienia".into())); }
+    if status != "W drodze" { return Err(ApiError::BadRequest("Nie można anulować tego zamówienia".into())); }
 
     // zwróć stany
     let items = sqlx::query("SELECT product_id, quantity FROM order_items WHERE order_id = ?")
@@ -698,14 +690,14 @@ async fn cancel_order(data: web::Data<AppState>, user: AuthUser, path: web::Path
             .await
             .map_err(|_| ApiError::Server)?;
     }
-    // ustaw status canceled
-    sqlx::query("UPDATE orders SET status = 'canceled' WHERE id = ?")
+    // ustaw status Anulowane
+    sqlx::query("UPDATE orders SET status = 'Anulowane' WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(|_| ApiError::Server)?;
     tx.commit().await.map_err(|_| ApiError::Server)?;
-    Ok(web::Json(serde_json::json!({"status":"canceled"})))
+    Ok(web::Json(serde_json::json!({"status":"Anulowane"})))
 }
 
 async fn init_db(pool: &MySqlPool) -> Result<(), sqlx::Error> {
