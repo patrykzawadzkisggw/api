@@ -354,7 +354,7 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
 #[get("/api/products/{id}")]
 async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Result<impl Responder, ApiError> {
     let id = path.into_inner();
-    let row = sqlx::query("SELECT id, name, price_cents, stock, details, storage, ingredients FROM products WHERE id = ?")
+    let row = sqlx::query("SELECT id, name, price_cents, stock, details, storage, ingredients, price_before_cents FROM products WHERE id = ?")
         .bind(id)
         .fetch_optional(&data.pool)
         .await
