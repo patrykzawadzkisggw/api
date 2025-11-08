@@ -449,7 +449,7 @@ struct CreateOrderResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct OrderItemOutput { product_id: i64, name: String, quantity: i64, price_cents: i64 }
+struct OrderItemOutput { product_id: i64, name: String, quantity: i64, price_cents: i64, image: String }
 
 #[derive(Debug, Serialize)]
 struct StockShortage { product_id: i64, available: i64, missing: i64 }
@@ -479,14 +479,14 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
     // sprawdz stany i policz ceny
     let mut total_cents: i64 = 0;
     let mut total_items: i64 = 0;
-    let mut resolved_items: Vec<(OrderItemInput, String, i64)> = Vec::new();
+    let mut resolved_items: Vec<(OrderItemInput, String, i64, String)> = Vec::new();
     // Zbieranie błędów w formie listy dla frontendu
     let mut products_not_found: Vec<i64> = Vec::new();
     let mut insufficient_stock: Vec<StockShortage> = Vec::new();
     for it in &req.items {
         if it.quantity <= 0 { return Err(ApiError::BadRequest("Ilość musi być > 0".into())); }
 
-        let row_opt = sqlx::query("SELECT name, price_cents, stock FROM products WHERE id = ?")
+        let row_opt = sqlx::query("SELECT name, price_cents, stock, CAST(images AS CHAR) AS images FROM products WHERE id = ?")
             .bind(it.product_id)
             .fetch_optional(&mut *tx)
             .await
@@ -500,13 +500,22 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
         let name: String = row.get("name");
         let price_cents: i64 = row.get("price_cents");
         let stock: i64 = row.get("stock");
+        // first image or default
+        let first_image: String = match row.try_get::<Option<String>, _>("images") {
+            Ok(Some(s)) => match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(serde_json::Value::Array(arr)) => arr.into_iter().find_map(|e| e.as_str().map(|s| s.to_string())).unwrap_or_else(|| "orange.png".to_string()),
+                Ok(serde_json::Value::String(inner)) => serde_json::from_str::<Vec<String>>(&inner).ok().and_then(|v| v.into_iter().next()).unwrap_or_else(|| "orange.png".to_string()),
+                _ => "orange.png".to_string(),
+            },
+            _ => "orange.png".to_string(),
+        };
         if stock < it.quantity {
             insufficient_stock.push(StockShortage { product_id: it.product_id, available: stock, missing: it.quantity - stock });
             continue;
         }
         total_cents += price_cents * it.quantity;
         total_items += it.quantity;
-        resolved_items.push((OrderItemInput{ product_id: it.product_id, quantity: it.quantity }, name, price_cents));
+    resolved_items.push((OrderItemInput{ product_id: it.product_id, quantity: it.quantity }, name, price_cents, first_image));
     }
 
     if !products_not_found.is_empty() || !insufficient_stock.is_empty() {
@@ -544,7 +553,7 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
 
     // wstaw pozycje i zdejmij stany
     let mut outputs: Vec<OrderItemOutput> = Vec::new();
-    for (it, name, price_cents) in resolved_items.into_iter() {
+    for (it, name, price_cents, image) in resolved_items.into_iter() {
         sqlx::query("INSERT INTO order_items(order_id, product_id, quantity, price_cents) VALUES(?, ?, ?, ?)")
             .bind(order_id)
             .bind(it.product_id)
@@ -559,7 +568,7 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
             .execute(&mut *tx)
             .await
             .map_err(|_| ApiError::Server)?;
-        outputs.push(OrderItemOutput{ product_id: it.product_id, name, quantity: it.quantity, price_cents });
+        outputs.push(OrderItemOutput{ product_id: it.product_id, name, quantity: it.quantity, price_cents, image });
     }
 
     tx.commit().await.map_err(|_| ApiError::Server)?;
@@ -607,6 +616,29 @@ async fn list_orders(data: web::Data<AppState>, user: AuthUser) -> Result<impl R
         .fetch_all(&data.pool)
         .await
         .map_err(|_| ApiError::Server)?;
+    // Build a map order_id -> Vec<String> with first image for each line item
+    let order_ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
+    let mut order_images: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    if !order_ids.is_empty() {
+        let placeholders = order_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT oi.order_id, CAST(p.images AS CHAR) AS images FROM order_items oi JOIN products p ON p.id = oi.product_id WHERE oi.order_id IN ({}) ORDER BY oi.id", placeholders);
+        let mut q = sqlx::query(&sql);
+        for oid in &order_ids { q = q.bind(oid); }
+        let img_rows = q.fetch_all(&data.pool).await.map_err(|_| ApiError::Server)?;
+        for ir in img_rows {
+            let oid: i64 = ir.get("order_id");
+            let first_image: String = match ir.try_get::<Option<String>, _>("images") {
+                Ok(Some(s)) => match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(serde_json::Value::Array(arr)) => arr.into_iter().find_map(|e| e.as_str().map(|s| s.to_string())).unwrap_or_else(|| "orange.png".to_string()),
+                    Ok(serde_json::Value::String(inner)) => serde_json::from_str::<Vec<String>>(&inner).ok().and_then(|v| v.into_iter().next()).unwrap_or_else(|| "orange.png".to_string()),
+                    _ => "orange.png".to_string(),
+                },
+                _ => "orange.png".to_string(),
+            };
+            order_images.entry(oid).or_insert_with(Vec::new).push(first_image);
+        }
+    }
+
     let list: Vec<OrderListItem> = rows
         .into_iter()
         .map(|r| {
@@ -615,21 +647,9 @@ async fn list_orders(data: web::Data<AppState>, user: AuthUser) -> Result<impl R
             let created_at: String = r.get("created_at");
             let total_cents: i64 = r.get("total_cents");
             let total_items: i64 = r.get("total_items");
-
-            // Status is stored already in Polish; use it directly
             let status = status_db;
-
-            let count = if total_items < 0 { 0 } else { total_items as usize };
-            let images: Vec<String> = std::iter::repeat("orange.png".to_string()).take(count).collect();
-
-            OrderListItem {
-                id,
-                status,
-                created_at,
-                total_cents,
-                total_items,
-                images,
-            }
+            let images = order_images.remove(&id).unwrap_or_default();
+            OrderListItem { id, status, created_at, total_cents, total_items, images }
         })
         .collect();
     Ok(web::Json(list))
@@ -645,16 +665,27 @@ async fn get_order(data: web::Data<AppState>, user: AuthUser, path: web::Path<i6
         .await
         .map_err(|_| ApiError::Server)?
         .ok_or(ApiError::NotFound)?;
-    let items_rows = sqlx::query("SELECT oi.product_id, p.name, oi.quantity, oi.price_cents FROM order_items oi JOIN products p ON p.id = oi.product_id WHERE oi.order_id = ?")
+    let items_rows = sqlx::query("SELECT oi.product_id, p.name, oi.quantity, oi.price_cents, CAST(p.images AS CHAR) AS images FROM order_items oi JOIN products p ON p.id = oi.product_id WHERE oi.order_id = ?")
         .bind(id)
         .fetch_all(&data.pool)
         .await
         .map_err(|_| ApiError::Server)?;
-    let items: Vec<OrderItemOutput> = items_rows.into_iter().map(|r| OrderItemOutput{
-        product_id: r.get("product_id"),
-        name: r.get("name"),
-        quantity: r.get("quantity"),
-        price_cents: r.get("price_cents"),
+    let items: Vec<OrderItemOutput> = items_rows.into_iter().map(|r| {
+        let first_image: String = match r.try_get::<Option<String>, _>("images") {
+            Ok(Some(s)) => match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(serde_json::Value::Array(arr)) => arr.into_iter().find_map(|e| e.as_str().map(|s| s.to_string())).unwrap_or_else(|| "orange.png".to_string()),
+                Ok(serde_json::Value::String(inner)) => serde_json::from_str::<Vec<String>>(&inner).ok().and_then(|v| v.into_iter().next()).unwrap_or_else(|| "orange.png".to_string()),
+                _ => "orange.png".to_string(),
+            },
+            _ => "orange.png".to_string(),
+        };
+        OrderItemOutput{
+            product_id: r.get("product_id"),
+            name: r.get("name"),
+            quantity: r.get("quantity"),
+            price_cents: r.get("price_cents"),
+            image: first_image,
+        }
     }).collect();
     // Status is stored in Polish in the DB; use it directly
     let status: String = row.get("status");
