@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS orders (
   status VARCHAR(32) NOT NULL,
   created_at VARCHAR(64) NOT NULL,
   total_cents BIGINT NOT NULL,
+  delivery_cents BIGINT NOT NULL DEFAULT 0,
+  discount_cents BIGINT NOT NULL DEFAULT 0,
   total_items BIGINT NOT NULL,
   first_name VARCHAR(255) NOT NULL,
   last_name VARCHAR(255) NOT NULL,

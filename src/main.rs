@@ -438,6 +438,8 @@ struct CreateOrderResponse {
     status: String,
     created_at: String,
     total_cents: i64,
+    delivery_cents: i64,
+    discount_cents: i64,
     total_items: i64,
     items: Vec<OrderItemOutput>,
     first_name: String,
@@ -530,14 +532,21 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
         return Err(ApiError::BadRequestJson(serde_json::Value::Object(obj)));
     }
 
-    // apply discount
-    if discount_pct > 0 { total_cents = total_cents - (total_cents * discount_pct / 100); }
+    // apply discount: keep subtotal before discount and compute discount amount
+    let subtotal_cents = total_cents;
+    let after_discount = if discount_pct > 0 { subtotal_cents - (subtotal_cents * discount_pct / 100) } else { subtotal_cents };
+    let discount_cents = subtotal_cents - after_discount;
+    // delivery cost can be configured via env DELIVERY_CENTS (in cents). Default 0.
+    let delivery_cents: i64 = env::var("DELIVERY_CENTS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let total_cents = after_discount + delivery_cents;
 
     // utworz zamowienie
     let now = Utc::now().to_rfc3339();
-    let res = sqlx::query("INSERT INTO orders(user_id, status, created_at, total_cents, total_items, first_name, last_name, city, postal_code, address, promo_code) VALUES(?, 'W drodze', ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    let res = sqlx::query("INSERT INTO orders(user_id, status, created_at, delivery_cents, discount_cents, total_cents, total_items, first_name, last_name, city, postal_code, address, promo_code) VALUES(?, 'W drodze', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(user.0)
         .bind(&now)
+        .bind(delivery_cents)
+        .bind(discount_cents)
         .bind(total_cents)
         .bind(total_items)
         .bind(&req.first_name)
@@ -658,7 +667,7 @@ async fn list_orders(data: web::Data<AppState>, user: AuthUser) -> Result<impl R
 #[get("/api/orders/{id}")]
 async fn get_order(data: web::Data<AppState>, user: AuthUser, path: web::Path<i64>) -> Result<impl Responder, ApiError> {
     let id = path.into_inner();
-    let row = sqlx::query("SELECT id, status, created_at, total_cents, total_items, first_name, last_name, city, postal_code, address, promo_code FROM orders WHERE id = ? AND user_id = ?")
+    let row = sqlx::query("SELECT id, status, created_at, total_cents, delivery_cents, discount_cents, total_items, first_name, last_name, city, postal_code, address, promo_code FROM orders WHERE id = ? AND user_id = ?")
         .bind(id)
         .bind(user.0)
         .fetch_optional(&data.pool)
@@ -694,7 +703,9 @@ async fn get_order(data: web::Data<AppState>, user: AuthUser, path: web::Path<i6
         id: row.get("id"),
         status,
         created_at: row.get("created_at"),
-        total_cents: row.get("total_cents"),
+    total_cents: row.get("total_cents"),
+    delivery_cents: row.get::<i64, _>("delivery_cents"),
+    discount_cents: row.get::<i64, _>("discount_cents"),
         total_items: row.get("total_items"),
         items,
         first_name: row.get("first_name"),
