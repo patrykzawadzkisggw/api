@@ -335,9 +335,14 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
     let list: Vec<ProductListItem> = rows
         .into_iter()
         .map(|r| {
-            let images: Vec<String> = match r.get::<Option<String>, _>("images") {
-                Some(s) => serde_json::from_str(&s).unwrap_or_default(),
-                None => Vec::new(),
+            // Parse images safely: JSON column may be returned as JSON value or string
+            let images: Vec<String> = match r.try_get::<Option<serde_json::Value>, _>("images") {
+                Ok(Some(val)) => match val {
+                    serde_json::Value::Array(arr) => arr.into_iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect(),
+                    serde_json::Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
             };
             let id: i64 = r.get("id");
             ProductListItem {
@@ -370,9 +375,13 @@ async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Resu
         storage: row.get("storage"),
         ingredients: row.get("ingredients"),
         price_before_cents: row.get::<Option<i64>, _>("price_before_cents"),
-        images: match row.get::<Option<String>, _>("images") {
-            Some(s) => serde_json::from_str(&s).unwrap_or_default(),
-            None => Vec::new(),
+        images: match row.try_get::<Option<serde_json::Value>, _>("images") {
+            Ok(Some(val)) => match val {
+                serde_json::Value::Array(arr) => arr.into_iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect(),
+                serde_json::Value::String(s) => serde_json::from_str(&s).unwrap_or_default(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
         },
     };
     Ok(web::Json(detail))
