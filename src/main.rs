@@ -315,15 +315,15 @@ struct ProductDetail {
 #[get("/api/products")]
 async fn products(data: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> Result<impl Responder, ApiError> {
     let maybe = query.get("name").cloned();
-    // Fetch basic product fields first
+    // Fetch basic product fields first; CAST(images AS CHAR) to ensure we get textual JSON from MySQL
     let rows = if let Some(name) = maybe {
-        sqlx::query("SELECT id, name, price_cents, price_before_cents, images FROM products WHERE name LIKE ? ORDER BY name")
+        sqlx::query("SELECT id, name, price_cents, price_before_cents, CAST(images AS CHAR) AS images FROM products WHERE name LIKE ? ORDER BY name")
             .bind(format!("%{}%", name))
             .fetch_all(&data.pool)
             .await
             .map_err(|_| ApiError::Server)?
     } else {
-        sqlx::query("SELECT id, name, price_cents, price_before_cents, images FROM products ORDER BY name")
+        sqlx::query("SELECT id, name, price_cents, price_before_cents, CAST(images AS CHAR) AS images FROM products ORDER BY name")
             .fetch_all(&data.pool)
             .await
             .map_err(|_| ApiError::Server)?
@@ -335,7 +335,7 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
         .into_iter()
         .map(|r| {
             // Parse images safely from a JSON string returned by MySQL driver
-            let images: Vec<String> = match r.try_get::<Option<String>, _>("images") {
+            let mut images: Vec<String> = match r.try_get::<Option<String>, _>("images") {
                 Ok(Some(s)) => {
                     // s is expected to be a JSON array like '["a.png","b.png"]'
                     match serde_json::from_str::<serde_json::Value>(&s) {
@@ -346,6 +346,10 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
                 }
                 _ => Vec::new(),
             };
+            // If there are no images stored, provide a sensible default so frontend has something to show
+            if images.is_empty() {
+                images.push("orange.png".to_string());
+            }
             let id: i64 = r.get("id");
             ProductListItem {
                 id,
@@ -362,7 +366,7 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
 #[get("/api/products/{id}")]
 async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Result<impl Responder, ApiError> {
     let id = path.into_inner();
-    let row = sqlx::query("SELECT id, name, price_cents, stock, details, storage, ingredients, price_before_cents, images FROM products WHERE id = ?")
+    let row = sqlx::query("SELECT id, name, price_cents, stock, details, storage, ingredients, price_before_cents, CAST(images AS CHAR) AS images FROM products WHERE id = ?")
         .bind(id)
         .fetch_optional(&data.pool)
         .await
@@ -377,13 +381,17 @@ async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Resu
         storage: row.get("storage"),
         ingredients: row.get("ingredients"),
         price_before_cents: row.get::<Option<i64>, _>("price_before_cents"),
-        images: match row.try_get::<Option<String>, _>("images") {
-            Ok(Some(s)) => match serde_json::from_str::<serde_json::Value>(&s) {
-                Ok(serde_json::Value::Array(arr)) => arr.into_iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect(),
-                Ok(serde_json::Value::String(inner)) => serde_json::from_str(&inner).unwrap_or_default(),
+        images: {
+            let mut imgs: Vec<String> = match row.try_get::<Option<String>, _>("images") {
+                Ok(Some(s)) => match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(serde_json::Value::Array(arr)) => arr.into_iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect(),
+                    Ok(serde_json::Value::String(inner)) => serde_json::from_str(&inner).unwrap_or_default(),
+                    _ => Vec::new(),
+                },
                 _ => Vec::new(),
-            },
-            _ => Vec::new(),
+            };
+            if imgs.is_empty() { imgs.push("orange.png".to_string()); }
+            imgs
         },
     };
     Ok(web::Json(detail))
