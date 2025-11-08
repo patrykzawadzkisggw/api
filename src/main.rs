@@ -298,7 +298,7 @@ fn validate_order_fields(req: &CreateOrderRequest) -> Option<serde_json::Value> 
 }
 
 #[derive(Debug, Serialize)]
-struct ProductListItem { id: i64, name: String, price_cents: i64, price_before_cents: Option<i64>, images: Vec<String>, categories: Vec<String> }
+struct ProductListItem { id: i64, name: String, price_cents: i64, price_before_cents: Option<i64>, images: Vec<String> }
 
 #[derive(Debug, Serialize)]
 struct ProductDetail {
@@ -311,7 +311,6 @@ struct ProductDetail {
     storage: String,
     ingredients: String,
     images: Vec<String>,
-    categories: Vec<String>,
 }
 
 #[get("/api/products")]
@@ -331,22 +330,7 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
             .map_err(|_| ApiError::Server)?
     };
 
-    // Collect product ids to fetch categories in one query
-    let ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
-    let mut categories_map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
-    if !ids.is_empty() {
-        // Build placeholders for IN clause
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT pc.product_id, c.name FROM product_categories pc JOIN categories c ON c.id = pc.category_id WHERE pc.product_id IN ({})", placeholders);
-        let mut q = sqlx::query(&sql);
-        for id in &ids { q = q.bind(id); }
-        let cat_rows = q.fetch_all(&data.pool).await.map_err(|_| ApiError::Server)?;
-        for cr in cat_rows {
-            let pid: i64 = cr.get("product_id");
-            let cname: String = cr.get("name");
-            categories_map.entry(pid).or_default().push(cname);
-        }
-    }
+    // Categories are omitted from the product endpoints per request.
 
     let list: Vec<ProductListItem> = rows
         .into_iter()
@@ -356,14 +340,12 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
                 None => Vec::new(),
             };
             let id: i64 = r.get("id");
-            let categories = categories_map.remove(&id).unwrap_or_default();
             ProductListItem {
                 id,
                 name: r.get("name"),
                 price_cents: r.get("price_cents"),
                 price_before_cents: r.get::<Option<i64>, _>("price_before_cents"),
                 images,
-                categories,
             }
         })
         .collect();
@@ -392,15 +374,7 @@ async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Resu
             Some(s) => serde_json::from_str(&s).unwrap_or_default(),
             None => Vec::new(),
         },
-        categories: {
-            // fetch categories for this product
-            let cat_rows = sqlx::query("SELECT c.name FROM product_categories pc JOIN categories c ON c.id = pc.category_id WHERE pc.product_id = ?")
-                .bind(id)
-                .fetch_all(&data.pool)
-                .await
-                .map_err(|_| ApiError::Server)?;
-            cat_rows.into_iter().map(|cr| cr.get::<String, _>("name")).collect()
-        },
+        // categories omitted by request
     };
     Ok(web::Json(detail))
 }
