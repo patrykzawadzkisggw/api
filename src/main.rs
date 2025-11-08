@@ -309,7 +309,8 @@ struct ProductDetail {
     details: String,
     storage: String,
     ingredients: String,
-    price_before_cents: Option<i64>
+    price_before_cents: Option<i64>,
+    images: Vec<String>,
 }
 
 #[get("/api/products")]
@@ -354,7 +355,7 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
 #[get("/api/products/{id}")]
 async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Result<impl Responder, ApiError> {
     let id = path.into_inner();
-    let row = sqlx::query("SELECT id, name, price_cents, stock, details, storage, ingredients, price_before_cents FROM products WHERE id = ?")
+    let row = sqlx::query("SELECT id, name, price_cents, stock, details, storage, ingredients, price_before_cents, images FROM products WHERE id = ?")
         .bind(id)
         .fetch_optional(&data.pool)
         .await
@@ -369,6 +370,10 @@ async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Resu
         storage: row.get("storage"),
         ingredients: row.get("ingredients"),
         price_before_cents: row.get::<Option<i64>, _>("price_before_cents"),
+        images: match row.get::<Option<String>, _>("images") {
+            Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+            None => Vec::new(),
+        },
     };
     Ok(web::Json(detail))
 }
