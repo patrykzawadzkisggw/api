@@ -297,7 +297,7 @@ fn validate_order_fields(req: &CreateOrderRequest) -> Option<serde_json::Value> 
 }
 
 #[derive(Debug, Serialize)]
-struct ProductListItem { id: i64, name: String, price_cents: i64, price_before_cents: Option<i64>, images: Vec<String> }
+struct ProductListItem { id: i64, name: String, price_cents: i64, price_before_cents: Option<i64>, images: Vec<String>, categories: Vec<String> }
 
 #[derive(Debug, Serialize)]
 struct ProductDetail {
@@ -310,6 +310,7 @@ struct ProductDetail {
     ingredients: String,
     price_before_cents: Option<i64>,
     images: Vec<String>,
+    categories: Vec<String>,
 }
 
 #[get("/api/products")]
@@ -329,7 +330,21 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
             .map_err(|_| ApiError::Server)?
     };
 
-    // Categories are omitted from the product endpoints per request.
+    // Gather product IDs for category lookup
+    let product_ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
+    let mut categories_map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    if !product_ids.is_empty() {
+        let placeholders = product_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT pc.product_id, c.name FROM product_categories pc JOIN categories c ON c.id = pc.category_id WHERE pc.product_id IN ({})", placeholders);
+        let mut q = sqlx::query(&sql);
+        for pid in &product_ids { q = q.bind(pid); }
+        let cat_rows = q.fetch_all(&data.pool).await.map_err(|_| ApiError::Server)?;
+        for cr in cat_rows {
+            let pid: i64 = cr.get("product_id");
+            let cname: String = cr.get("name");
+            categories_map.entry(pid).or_insert_with(Vec::new).push(cname);
+        }
+    }
 
     let list: Vec<ProductListItem> = rows
         .into_iter()
@@ -337,7 +352,6 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
             // Parse images safely from a JSON string returned by MySQL driver
             let mut images: Vec<String> = match r.try_get::<Option<String>, _>("images") {
                 Ok(Some(s)) => {
-                    // s is expected to be a JSON array like '["a.png","b.png"]'
                     match serde_json::from_str::<serde_json::Value>(&s) {
                         Ok(serde_json::Value::Array(arr)) => arr.into_iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect(),
                         Ok(serde_json::Value::String(inner)) => serde_json::from_str(&inner).unwrap_or_default(),
@@ -346,17 +360,16 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
                 }
                 _ => Vec::new(),
             };
-            // If there are no images stored, provide a sensible default so frontend has something to show
-            if images.is_empty() {
-                images.push("orange.png".to_string());
-            }
+            if images.is_empty() { images.push("orange.png".to_string()); }
             let id: i64 = r.get("id");
+            let categories = categories_map.remove(&id).unwrap_or_default();
             ProductListItem {
                 id,
                 name: r.get("name"),
                 price_cents: r.get("price_cents"),
                 price_before_cents: r.get::<Option<i64>, _>("price_before_cents"),
                 images,
+                categories,
             }
         })
         .collect();
@@ -372,6 +385,13 @@ async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Resu
         .await
         .map_err(|_| ApiError::Server)?
         .ok_or(ApiError::NotFound)?;
+    // Fetch categories for this product
+    let cat_rows = sqlx::query("SELECT c.name FROM product_categories pc JOIN categories c ON c.id = pc.category_id WHERE pc.product_id = ?")
+        .bind(id)
+        .fetch_all(&data.pool)
+        .await
+        .map_err(|_| ApiError::Server)?;
+    let categories: Vec<String> = cat_rows.into_iter().map(|cr| cr.get::<String, _>("name")).collect();
     let detail = ProductDetail {
         id: row.get("id"),
         name: row.get("name"),
@@ -393,6 +413,7 @@ async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Resu
             if imgs.is_empty() { imgs.push("orange.png".to_string()); }
             imgs
         },
+        categories,
     };
     Ok(web::Json(detail))
 }
