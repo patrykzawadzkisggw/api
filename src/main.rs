@@ -587,6 +587,8 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
         status: "W drodze".into(),
         created_at: now,
         total_cents,
+        delivery_cents,
+        discount_cents,
         total_items,
         items: outputs,
         first_name: req.first_name,
