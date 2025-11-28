@@ -17,6 +17,9 @@ use uuid::Uuid;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+// Fuzzy search helpers
+use deunicode::deunicode;
+use strsim::damerau_levenshtein;
 
 #[derive(Clone)]
 struct AppState {
@@ -401,6 +404,13 @@ fn normalize_polish(s: &str) -> String {
     out.chars().filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace()).collect()
 }
 
+// Normalize text: lowercase, remove diacritics and punctuation
+fn normalize_text(s: &str) -> String {
+    let lowered = s.to_lowercase();
+    let ascii = deunicode(&lowered);
+    ascii.chars().filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace()).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 // Simple Levenshtein distance (iterative, memory optimized)
 fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
@@ -506,7 +516,8 @@ async fn products_by_ids(data: web::Data<AppState>, query: web::Query<std::colle
 #[get("/api/products/search")]
 async fn products_search(data: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> Result<impl Responder, ApiError> {
     let q = query.get("q").map(|s| s.trim()).filter(|s| !s.is_empty()).ok_or(ApiError::BadRequest("Query parameter 'q' is required".into()))?;
-    let q_norm = normalize_polish(q);
+    // Normalize query (remove diacritics, lowercase)
+    let q_norm = normalize_text(q);
 
     let rows = sqlx::query("SELECT id, name, price_cents, price_before_cents, CAST(images AS CHAR) AS images, CAST(ingredients AS CHAR) AS ingredients FROM products")
         .fetch_all(&data.pool)
@@ -524,23 +535,41 @@ async fn products_search(data: web::Data<AppState>, query: web::Query<std::colle
         for cr in cat_rows { let pid: i64 = cr.get("product_id"); let name: String = cr.get("name"); categories_map.entry(pid).or_default().push(name); }
     }
 
-    let mut candidates: Vec<(usize, sqlx::mysql::MySqlRow)> = Vec::new();
+    // Score by Damerau-Levenshtein on stemmed tokens (name, categories, ingredients)
+    let mut candidates: Vec<(f64, sqlx::mysql::MySqlRow)> = Vec::new();
     for r in rows.into_iter() {
         let id: i64 = r.get("id");
         let name: String = r.get("name");
         let ingredients: String = r.get::<String, _>("ingredients");
         let cats = categories_map.get(&id).cloned().unwrap_or_default();
-        let search_text = format!("{} {} {}", name, cats.join(" "), ingredients);
-        let st_norm = normalize_polish(&search_text);
-        let dist = levenshtein(&q_norm, &st_norm);
-        let max_len = std::cmp::max(q_norm.len(), st_norm.len());
-        let score = if max_len == 0 { 0 } else { (dist * 100) / max_len };
-        if score <= 60 || dist <= 2 {
-            candidates.push((score, r));
+
+        let name_norm = normalize_text(&name);
+        let ing_norm = normalize_text(&ingredients);
+        let cats_norm = cats.iter().map(|c| normalize_text(c)).collect::<Vec<_>>().join(" ");
+
+        // Exact substring match (fast path)
+        if (!name_norm.is_empty() && name_norm.contains(&q_norm)) || (!ing_norm.is_empty() && ing_norm.contains(&q_norm)) || (!cats_norm.is_empty() && cats_norm.contains(&q_norm)) {
+            candidates.push((0.0f64, r));
+            continue;
+        }
+
+        // Compute minimal Damerau-Levenshtein distance among fields
+        let mut min_d = std::usize::MAX;
+        if !name_norm.is_empty() { min_d = std::cmp::min(min_d, damerau_levenshtein(&q_norm, &name_norm)); }
+        if !ing_norm.is_empty() { min_d = std::cmp::min(min_d, damerau_levenshtein(&q_norm, &ing_norm)); }
+        if !cats_norm.is_empty() { min_d = std::cmp::min(min_d, damerau_levenshtein(&q_norm, &cats_norm)); }
+        if min_d == std::usize::MAX { continue; }
+
+        let denom = std::cmp::max(q_norm.len(), 1);
+        let ratio = (min_d as f64) / (denom as f64);
+        // Accept if small absolute edits or reasonable relative distance
+        if min_d <= 3 || ratio <= 0.6 {
+            candidates.push((ratio, r));
         }
     }
 
-    candidates.sort_by_key(|(score, _)| *score);
+    // Sort ascending by ratio (best matches first)
+    candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let limited_rows: Vec<sqlx::mysql::MySqlRow> = candidates.into_iter().take(100).map(|(_, r)| r).collect();
 
     let returned_ids: Vec<i64> = limited_rows.iter().map(|r| r.get::<i64, _>("id")).collect();
