@@ -376,6 +376,188 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
     Ok(web::Json(list))
 }
 
+// Normalize Polish characters and remove punctuation for fuzzy comparisons
+fn normalize_polish(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let nc = match ch {
+            'ą'|'Ą' => 'a',
+            'ć'|'Ć' => 'c',
+            'ę'|'Ę' => 'e',
+            'ł'|'Ł' => 'l',
+            'ń'|'Ń' => 'n',
+            'ó'|'Ó' => 'o',
+            'ś'|'Ś' => 's',
+            'ż'|'Ż' => 'z',
+            'ź'|'Ź' => 'z',
+            other => other,
+        };
+        if nc.is_ascii() {
+            out.push(nc.to_ascii_lowercase());
+        } else {
+            for c in nc.to_lowercase() { out.push(c); }
+        }
+    }
+    out.chars().filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace()).collect()
+}
+
+// Simple Levenshtein distance (iterative, memory optimized)
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let n = a_chars.len();
+    let m = b_chars.len();
+    if n == 0 { return m; }
+    if m == 0 { return n; }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur: Vec<usize> = vec![0; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = if a_chars[i-1] == b_chars[j-1] { 0 } else { 1 };
+            cur[j] = std::cmp::min(std::cmp::min(prev[j] + 1, cur[j-1] + 1), prev[j-1] + cost);
+        }
+        prev.clone_from_slice(&cur);
+    }
+    cur[m]
+}
+
+// Helper to build ProductListItem vector from SQL rows and categories_map
+fn build_product_list(rows: Vec<Row>, categories_map: &std::collections::HashMap<i64, Vec<String>>) -> Vec<ProductListItem> {
+    rows.into_iter()
+        .map(|r| {
+            let id: i64 = r.get("id");
+            let mut images: Vec<String> = match r.try_get::<Option<String>, _>("images") {
+                Ok(Some(s)) => {
+                    match serde_json::from_str::<serde_json::Value>(&s) {
+                        Ok(serde_json::Value::Array(arr)) => arr.into_iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect(),
+                        Ok(serde_json::Value::String(inner)) => serde_json::from_str(&inner).unwrap_or_default(),
+                        _ => Vec::new(),
+                    }
+                }
+                _ => Vec::new(),
+            };
+            if images.is_empty() { images.push("orange.png".to_string()); }
+            ProductListItem {
+                id,
+                name: r.get("name"),
+                price_cents: r.get("price_cents"),
+                price_before_cents: r.get::<Option<i64>, _>("price_before_cents"),
+                images,
+                categories: categories_map.get(&id).cloned().unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+#[get("/api/products/recommended")]
+async fn products_recommended(data: web::Data<AppState>) -> Result<impl Responder, ApiError> {
+    let rows = sqlx::query("SELECT id, name, price_cents, price_before_cents, CAST(images AS CHAR) AS images FROM products ORDER BY id LIMIT 5")
+        .fetch_all(&data.pool)
+        .await
+        .map_err(|_| ApiError::Server)?;
+
+    let product_ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
+    let mut categories_map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    if !product_ids.is_empty() {
+        let placeholders = product_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT pc.product_id, c.name FROM product_categories pc JOIN categories c ON c.id = pc.category_id WHERE pc.product_id IN ({})", placeholders);
+        let mut q = sqlx::query(&sql);
+        for pid in &product_ids { q = q.bind(pid); }
+        let cat_rows = q.fetch_all(&data.pool).await.map_err(|_| ApiError::Server)?;
+        for cr in cat_rows { let pid: i64 = cr.get("product_id"); let name: String = cr.get("name"); categories_map.entry(pid).or_default().push(name); }
+    }
+
+    let list = build_product_list(rows, &categories_map);
+    Ok(web::Json(list))
+}
+
+#[get("/api/products/by_ids")]
+async fn products_by_ids(data: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> Result<impl Responder, ApiError> {
+    let ids_param = query.get("ids").map(|s| s.trim()).filter(|s| !s.is_empty()).ok_or(ApiError::BadRequest("Query parameter 'ids' is required".into()))?;
+    let mut ids: Vec<i64> = Vec::new();
+    for part in ids_param.split(',') {
+        if let Ok(v) = part.trim().parse::<i64>() { ids.push(v); }
+    }
+    if ids.is_empty() { return Ok(web::Json(Vec::<ProductListItem>::new())); }
+
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT id, name, price_cents, price_before_cents, CAST(images AS CHAR) AS images FROM products WHERE id IN ({}) ORDER BY FIELD(id, {})", placeholders, ids.iter().map(|_| "?").collect::<Vec<_>>().join(","));
+    let mut q = sqlx::query(&sql);
+    for id in &ids { q = q.bind(id); }
+    for id in &ids { q = q.bind(id); }
+    let rows = q.fetch_all(&data.pool).await.map_err(|_| ApiError::Server)?;
+
+    let product_ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
+    let mut categories_map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    if !product_ids.is_empty() {
+        let placeholders = product_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT pc.product_id, c.name FROM product_categories pc JOIN categories c ON c.id = pc.category_id WHERE pc.product_id IN ({})", placeholders);
+        let mut q = sqlx::query(&sql);
+        for pid in &product_ids { q = q.bind(pid); }
+        let cat_rows = q.fetch_all(&data.pool).await.map_err(|_| ApiError::Server)?;
+        for cr in cat_rows { let pid: i64 = cr.get("product_id"); let name: String = cr.get("name"); categories_map.entry(pid).or_default().push(name); }
+    }
+
+    let list = build_product_list(rows, &categories_map);
+    Ok(web::Json(list))
+}
+
+#[get("/api/products/search")]
+async fn products_search(data: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> Result<impl Responder, ApiError> {
+    let q = query.get("q").map(|s| s.trim()).filter(|s| !s.is_empty()).ok_or(ApiError::BadRequest("Query parameter 'q' is required".into()))?;
+    let q_norm = normalize_polish(q);
+
+    let rows = sqlx::query("SELECT id, name, price_cents, price_before_cents, CAST(images AS CHAR) AS images, CAST(ingredients AS CHAR) AS ingredients FROM products")
+        .fetch_all(&data.pool)
+        .await
+        .map_err(|_| ApiError::Server)?;
+
+    let product_ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
+    let mut categories_map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    if !product_ids.is_empty() {
+        let placeholders = product_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT pc.product_id, c.name FROM product_categories pc JOIN categories c ON c.id = pc.category_id WHERE pc.product_id IN ({})", placeholders);
+        let mut q = sqlx::query(&sql);
+        for pid in &product_ids { q = q.bind(pid); }
+        let cat_rows = q.fetch_all(&data.pool).await.map_err(|_| ApiError::Server)?;
+        for cr in cat_rows { let pid: i64 = cr.get("product_id"); let name: String = cr.get("name"); categories_map.entry(pid).or_default().push(name); }
+    }
+
+    let mut candidates: Vec<(usize, Row)> = Vec::new();
+    for r in rows.into_iter() {
+        let id: i64 = r.get("id");
+        let name: String = r.get("name");
+        let ingredients: String = r.get::<String, _>("ingredients");
+        let cats = categories_map.get(&id).cloned().unwrap_or_default();
+        let search_text = format!("{} {} {}", name, cats.join(" "), ingredients);
+        let st_norm = normalize_polish(&search_text);
+        let dist = levenshtein(&q_norm, &st_norm);
+        let max_len = std::cmp::max(q_norm.len(), st_norm.len());
+        let score = if max_len == 0 { 0 } else { (dist * 100) / max_len };
+        if score <= 60 || dist <= 2 {
+            candidates.push((score, r));
+        }
+    }
+
+    candidates.sort_by_key(|(score, _)| *score);
+    let limited_rows: Vec<Row> = candidates.into_iter().take(100).map(|(_, r)| r).collect();
+
+    let returned_ids: Vec<i64> = limited_rows.iter().map(|r| r.get::<i64, _>("id")).collect();
+    let mut returned_cat_map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    if !returned_ids.is_empty() {
+        let placeholders = returned_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT pc.product_id, c.name FROM product_categories pc JOIN categories c ON c.id = pc.category_id WHERE pc.product_id IN ({})", placeholders);
+        let mut q = sqlx::query(&sql);
+        for pid in &returned_ids { q = q.bind(pid); }
+        let cat_rows = q.fetch_all(&data.pool).await.map_err(|_| ApiError::Server)?;
+        for cr in cat_rows { let pid: i64 = cr.get("product_id"); let name: String = cr.get("name"); returned_cat_map.entry(pid).or_default().push(name); }
+    }
+
+    let list = build_product_list(limited_rows, &returned_cat_map);
+    Ok(web::Json(list))
+}
+
 #[get("/api/products/{id}")]
 async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Result<impl Responder, ApiError> {
     let id = path.into_inner();
