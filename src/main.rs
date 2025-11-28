@@ -423,7 +423,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 // Helper to build ProductListItem vector from SQL rows and categories_map
-fn build_product_list(rows: Vec<Row>, categories_map: &std::collections::HashMap<i64, Vec<String>>) -> Vec<ProductListItem> {
+fn build_product_list(rows: Vec<sqlx::mysql::MySqlRow>, categories_map: &std::collections::HashMap<i64, Vec<String>>) -> Vec<ProductListItem> {
     rows.into_iter()
         .map(|r| {
             let id: i64 = r.get("id");
@@ -524,7 +524,7 @@ async fn products_search(data: web::Data<AppState>, query: web::Query<std::colle
         for cr in cat_rows { let pid: i64 = cr.get("product_id"); let name: String = cr.get("name"); categories_map.entry(pid).or_default().push(name); }
     }
 
-    let mut candidates: Vec<(usize, Row)> = Vec::new();
+    let mut candidates: Vec<(usize, sqlx::mysql::MySqlRow)> = Vec::new();
     for r in rows.into_iter() {
         let id: i64 = r.get("id");
         let name: String = r.get("name");
@@ -541,7 +541,7 @@ async fn products_search(data: web::Data<AppState>, query: web::Query<std::colle
     }
 
     candidates.sort_by_key(|(score, _)| *score);
-    let limited_rows: Vec<Row> = candidates.into_iter().take(100).map(|(_, r)| r).collect();
+    let limited_rows: Vec<sqlx::mysql::MySqlRow> = candidates.into_iter().take(100).map(|(_, r)| r).collect();
 
     let returned_ids: Vec<i64> = limited_rows.iter().map(|r| r.get::<i64, _>("id")).collect();
     let mut returned_cat_map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
