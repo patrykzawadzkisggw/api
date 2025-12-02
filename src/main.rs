@@ -370,6 +370,7 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
                 id,
                 name: r.get("name"),
                 price_cents: r.get("price_cents"),
+                stock: r.get::<i64, _>("stock"),
                 price_before_cents: r.get::<Option<i64>, _>("price_before_cents"),
                 images,
                 categories,
