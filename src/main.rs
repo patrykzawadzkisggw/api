@@ -300,7 +300,7 @@ fn validate_order_fields(req: &CreateOrderRequest) -> Option<serde_json::Value> 
 }
 
 #[derive(Debug, Serialize)]
-struct ProductListItem { id: i64, name: String, price_cents: i64, price_before_cents: Option<i64>, images: Vec<String>, categories: Vec<String> }
+struct ProductListItem { id: i64, name: String, price_cents: i64, stock: i64, price_before_cents: Option<i64>, images: Vec<String>, categories: Vec<String> }
 
 #[derive(Debug, Serialize)]
 struct ProductDetail {
@@ -321,13 +321,13 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
     let maybe = query.get("name").cloned();
     // Fetch basic product fields first; CAST(images AS CHAR) to ensure we get textual JSON from MySQL
     let rows = if let Some(name) = maybe {
-        sqlx::query("SELECT id, name, price_cents, price_before_cents, CAST(images AS CHAR) AS images FROM products WHERE name LIKE ? ORDER BY name")
+        sqlx::query("SELECT id, name, price_cents, stock, price_before_cents, CAST(images AS CHAR) AS images FROM products WHERE name LIKE ? ORDER BY name")
             .bind(format!("%{}%", name))
             .fetch_all(&data.pool)
             .await
             .map_err(|_| ApiError::Server)?
     } else {
-        sqlx::query("SELECT id, name, price_cents, price_before_cents, CAST(images AS CHAR) AS images FROM products ORDER BY name")
+        sqlx::query("SELECT id, name, price_cents, stock, price_before_cents, CAST(images AS CHAR) AS images FROM products ORDER BY name")
             .fetch_all(&data.pool)
             .await
             .map_err(|_| ApiError::Server)?
@@ -452,6 +452,7 @@ fn build_product_list(rows: Vec<sqlx::mysql::MySqlRow>, categories_map: &std::co
                 id,
                 name: r.get("name"),
                 price_cents: r.get("price_cents"),
+                stock: r.get::<i64, _>("stock"),
                 price_before_cents: r.get::<Option<i64>, _>("price_before_cents"),
                 images,
                 categories: categories_map.get(&id).cloned().unwrap_or_default(),
@@ -462,7 +463,7 @@ fn build_product_list(rows: Vec<sqlx::mysql::MySqlRow>, categories_map: &std::co
 
 #[get("/api/products/recommended")]
 async fn products_recommended(data: web::Data<AppState>) -> Result<impl Responder, ApiError> {
-    let rows = sqlx::query("SELECT id, name, price_cents, price_before_cents, CAST(images AS CHAR) AS images FROM products ORDER BY id LIMIT 5")
+    let rows = sqlx::query("SELECT id, name, price_cents, stock, price_before_cents, CAST(images AS CHAR) AS images FROM products ORDER BY id LIMIT 5")
         .fetch_all(&data.pool)
         .await
         .map_err(|_| ApiError::Server)?;
@@ -492,7 +493,7 @@ async fn products_by_ids(data: web::Data<AppState>, query: web::Query<std::colle
     if ids.is_empty() { return Ok(web::Json(Vec::<ProductListItem>::new())); }
 
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!("SELECT id, name, price_cents, price_before_cents, CAST(images AS CHAR) AS images FROM products WHERE id IN ({}) ORDER BY FIELD(id, {})", placeholders, ids.iter().map(|_| "?").collect::<Vec<_>>().join(","));
+    let sql = format!("SELECT id, name, price_cents, stock, price_before_cents, CAST(images AS CHAR) AS images FROM products WHERE id IN ({}) ORDER BY FIELD(id, {})", placeholders, ids.iter().map(|_| "?").collect::<Vec<_>>().join(","));
     let mut q = sqlx::query(&sql);
     for id in &ids { q = q.bind(id); }
     for id in &ids { q = q.bind(id); }
@@ -519,7 +520,7 @@ async fn products_search(data: web::Data<AppState>, query: web::Query<std::colle
     // Normalize query (remove diacritics, lowercase)
     let q_norm = normalize_text(q);
 
-    let rows = sqlx::query("SELECT id, name, price_cents, price_before_cents, CAST(images AS CHAR) AS images, CAST(ingredients AS CHAR) AS ingredients FROM products")
+    let rows = sqlx::query("SELECT id, name, price_cents, stock, price_before_cents, CAST(images AS CHAR) AS images, CAST(ingredients AS CHAR) AS ingredients FROM products")
         .fetch_all(&data.pool)
         .await
         .map_err(|_| ApiError::Server)?;
