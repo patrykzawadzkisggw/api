@@ -13,11 +13,9 @@ use std::io::{self, BufReader};
 use thiserror::Error;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
-// TLS
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-// Fuzzy search helpers
 use deunicode::deunicode;
 use strsim::damerau_levenshtein;
 
@@ -63,7 +61,6 @@ impl FromRequest for AuthUser {
                 &Validation::new(Algorithm::HS256),
             )
             .map_err(|_| ErrorUnauthorized("Nieprawidłowy token"))?;
-            // Sprawdź czy token nie został wylogowany (zlistowany)
             let revoked = sqlx::query("SELECT 1 FROM revoked_tokens WHERE token = ? LIMIT 1")
                 .bind(token)
                 .fetch_optional(&state.pool)
@@ -137,7 +134,6 @@ async fn register(data: web::Data<AppState>, body: web::Json<LoginRequest>) -> R
         }
         Err(e) => {
             if let sqlx::Error::Database(db) = &e {
-                // MySQL duplicate entry error code is 1062
                 if db.code().map(|c| c == "1062").unwrap_or(false) || db.message().contains("Duplicate entry") {
                     return Err(ApiError::BadRequest("Login niedostępny".into()));
                 } else {
@@ -319,7 +315,6 @@ struct ProductDetail {
 #[get("/api/products")]
 async fn products(data: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> Result<impl Responder, ApiError> {
     let maybe = query.get("name").cloned();
-    // Fetch basic product fields first; CAST(images AS CHAR) to ensure we get textual JSON from MySQL
     let rows = if let Some(name) = maybe {
         sqlx::query("SELECT id, name, price_cents, stock, price_before_cents, CAST(images AS CHAR) AS images FROM products WHERE name LIKE ? ORDER BY name")
             .bind(format!("%{}%", name))
@@ -333,7 +328,6 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
             .map_err(|_| ApiError::Server)?
     };
 
-    // Gather product IDs for category lookup
     let product_ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
     let mut categories_map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
     if !product_ids.is_empty() {
@@ -352,7 +346,6 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
     let list: Vec<ProductListItem> = rows
         .into_iter()
         .map(|r| {
-            // Parse images safely from a JSON string returned by MySQL driver
             let mut images: Vec<String> = match r.try_get::<Option<String>, _>("images") {
                 Ok(Some(s)) => {
                     match serde_json::from_str::<serde_json::Value>(&s) {
@@ -587,7 +580,7 @@ struct CreateOrderRequest {
     last_name: String,
     city: String,
     postal_code: String,
-    address: String, // "ulica i numer domu/mieszkania"
+    address: String,
     promo_code: Option<String>,
     items: Vec<OrderItemInput>,
 }
@@ -688,9 +681,10 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
     }
 
     let products_sum_cents = total_cents;
-    let discount_cents = if discount_pct > 0 { products_sum_cents * discount_pct / 100 } else { 0 };
     let delivery_cents: i64 = if products_sum_cents < 30000 { 1500 } else { 0 };
-    let total_cents = products_sum_cents + delivery_cents - discount_cents;
+    let base_for_discount = products_sum_cents + delivery_cents;
+    let discount_cents = if discount_pct > 0 { base_for_discount * discount_pct / 100 } else { 0 };
+    let total_cents = base_for_discount - discount_cents;
 
     let now = Utc::now().to_rfc3339();
     let res = sqlx::query("INSERT INTO orders(user_id, status, created_at, delivery_cents, discount_cents, total_cents, total_items, first_name, last_name, city, postal_code, address, promo_code) VALUES(?, 'W drodze', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -913,7 +907,6 @@ async fn discount_check(data: web::Data<AppState>, body: web::Json<DiscountCheck
 async fn cancel_order(data: web::Data<AppState>, user: AuthUser, path: web::Path<i64>) -> Result<impl Responder, ApiError> {
     let id = path.into_inner();
     let mut tx = data.pool.begin().await.map_err(|_| ApiError::Server)?;
-    // sprawdz status
     let row = sqlx::query("SELECT status FROM orders WHERE id = ? AND user_id = ?")
         .bind(id)
         .bind(user.0)
@@ -924,7 +917,6 @@ async fn cancel_order(data: web::Data<AppState>, user: AuthUser, path: web::Path
     let status: String = row.get("status");
     if status != "W drodze" { return Err(ApiError::BadRequest("Nie można anulować tego zamówienia".into())); }
 
-    // zwróć stany
     let items = sqlx::query("SELECT product_id, quantity FROM order_items WHERE order_id = ?")
         .bind(id)
         .fetch_all(&mut *tx)
@@ -940,7 +932,6 @@ async fn cancel_order(data: web::Data<AppState>, user: AuthUser, path: web::Path
             .await
             .map_err(|_| ApiError::Server)?;
     }
-    // ustaw status Anulowane
     sqlx::query("UPDATE orders SET status = 'Anulowane' WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)
@@ -1036,12 +1027,10 @@ async fn ensure_mysql_database(url: &str) {
 }
 
 async fn wait_for_mysql_and_connect(url: &str) -> MySqlPool {
-    // Nieskończone próby z narastającym backoffem (1s..10s)
     let mut attempt: u32 = 0;
     let mut backoff = Duration::from_secs(1);
     loop {
         attempt += 1;
-        // Spróbuj utworzyć bazę (idempotentnie); jeśli serwer nie wstał, to się nie uda i spróbujemy ponownie
         ensure_mysql_database(url).await;
         match MySqlPoolOptions::new().max_connections(30).connect(url).await {
             Ok(pool) => {
