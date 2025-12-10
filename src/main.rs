@@ -380,60 +380,14 @@ async fn products(data: web::Data<AppState>, query: web::Query<std::collections:
     Ok(web::Json(list))
 }
 
-// Normalize Polish characters and remove punctuation for fuzzy comparisons
-fn normalize_polish(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        let nc = match ch {
-            'ą'|'Ą' => 'a',
-            'ć'|'Ć' => 'c',
-            'ę'|'Ę' => 'e',
-            'ł'|'Ł' => 'l',
-            'ń'|'Ń' => 'n',
-            'ó'|'Ó' => 'o',
-            'ś'|'Ś' => 's',
-            'ż'|'Ż' => 'z',
-            'ź'|'Ź' => 'z',
-            other => other,
-        };
-        if nc.is_ascii() {
-            out.push(nc.to_ascii_lowercase());
-        } else {
-            for c in nc.to_lowercase() { out.push(c); }
-        }
-    }
-    out.chars().filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace()).collect()
-}
 
-// Normalize text: lowercase, remove diacritics and punctuation
 fn normalize_text(s: &str) -> String {
     let lowered = s.to_lowercase();
     let ascii = deunicode(&lowered);
     ascii.chars().filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace()).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-// Simple Levenshtein distance (iterative, memory optimized)
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let n = a_chars.len();
-    let m = b_chars.len();
-    if n == 0 { return m; }
-    if m == 0 { return n; }
-    let mut prev: Vec<usize> = (0..=m).collect();
-    let mut cur: Vec<usize> = vec![0; m + 1];
-    for i in 1..=n {
-        cur[0] = i;
-        for j in 1..=m {
-            let cost = if a_chars[i-1] == b_chars[j-1] { 0 } else { 1 };
-            cur[j] = std::cmp::min(std::cmp::min(prev[j] + 1, cur[j-1] + 1), prev[j-1] + cost);
-        }
-        prev.clone_from_slice(&cur);
-    }
-    cur[m]
-}
 
-// Helper to build ProductListItem vector from SQL rows and categories_map
 fn build_product_list(rows: Vec<sqlx::mysql::MySqlRow>, categories_map: &std::collections::HashMap<i64, Vec<String>>) -> Vec<ProductListItem> {
     rows.into_iter()
         .map(|r| {
@@ -518,7 +472,6 @@ async fn products_by_ids(data: web::Data<AppState>, query: web::Query<std::colle
 #[get("/api/products/search")]
 async fn products_search(data: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> Result<impl Responder, ApiError> {
     let q = query.get("q").map(|s| s.trim()).filter(|s| !s.is_empty()).ok_or(ApiError::BadRequest("Query parameter 'q' is required".into()))?;
-    // Normalize query (remove diacritics, lowercase)
     let q_norm = normalize_text(q);
 
     let rows = sqlx::query("SELECT id, name, price_cents, stock, price_before_cents, CAST(images AS CHAR) AS images, CAST(ingredients AS CHAR) AS ingredients FROM products")
@@ -537,7 +490,6 @@ async fn products_search(data: web::Data<AppState>, query: web::Query<std::colle
         for cr in cat_rows { let pid: i64 = cr.get("product_id"); let name: String = cr.get("name"); categories_map.entry(pid).or_default().push(name); }
     }
 
-    // Score by Damerau-Levenshtein on stemmed tokens (name, categories, ingredients)
     let mut candidates: Vec<(f64, sqlx::mysql::MySqlRow)> = Vec::new();
     for r in rows.into_iter() {
         let id: i64 = r.get("id");
@@ -549,13 +501,11 @@ async fn products_search(data: web::Data<AppState>, query: web::Query<std::colle
         let ing_norm = normalize_text(&ingredients);
         let cats_norm = cats.iter().map(|c| normalize_text(c)).collect::<Vec<_>>().join(" ");
 
-        // Exact substring match (fast path)
         if (!name_norm.is_empty() && name_norm.contains(&q_norm)) || (!ing_norm.is_empty() && ing_norm.contains(&q_norm)) || (!cats_norm.is_empty() && cats_norm.contains(&q_norm)) {
             candidates.push((0.0f64, r));
             continue;
         }
 
-        // Compute minimal Damerau-Levenshtein distance among fields
         let mut min_d = std::usize::MAX;
         if !name_norm.is_empty() { min_d = std::cmp::min(min_d, damerau_levenshtein(&q_norm, &name_norm)); }
         if !ing_norm.is_empty() { min_d = std::cmp::min(min_d, damerau_levenshtein(&q_norm, &ing_norm)); }
@@ -564,13 +514,11 @@ async fn products_search(data: web::Data<AppState>, query: web::Query<std::colle
 
         let denom = std::cmp::max(q_norm.len(), 1);
         let ratio = (min_d as f64) / (denom as f64);
-        // Accept if small absolute edits or reasonable relative distance
         if min_d <= 3 || ratio <= 0.6 {
             candidates.push((ratio, r));
         }
     }
 
-    // Sort ascending by ratio (best matches first)
     candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let limited_rows: Vec<sqlx::mysql::MySqlRow> = candidates.into_iter().take(100).map(|(_, r)| r).collect();
 
@@ -598,7 +546,6 @@ async fn product_detail(data: web::Data<AppState>, path: web::Path<i64>) -> Resu
         .await
         .map_err(|_| ApiError::Server)?
         .ok_or(ApiError::NotFound)?;
-    // Fetch categories for this product
     let cat_rows = sqlx::query("SELECT c.name FROM product_categories pc JOIN categories c ON c.id = pc.category_id WHERE pc.product_id = ?")
         .bind(id)
         .fetch_all(&data.pool)
@@ -674,14 +621,12 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
     let req = body.into_inner();
     if req.items.is_empty() { return Err(ApiError::BadRequest("Lista produktów nie może być pusta".into())); }
 
-    // Validate contact/address fields before touching DB so frontend gets immediate structured feedback
     if let Some(val) = validate_order_fields(&req) {
         return Err(ApiError::BadRequestJson(val));
     }
 
     let mut tx = data.pool.begin().await.map_err(|_| ApiError::Server)?;
 
-    // sprawdz promo code
     let mut discount_pct: i64 = 0;
     if let Some(code) = &req.promo_code {
         if let Some((pct, active)) = get_discount(&data.pool, code).await? {
@@ -691,11 +636,9 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
         }
     }
 
-    // sprawdz stany i policz ceny
     let mut total_cents: i64 = 0;
     let mut total_items: i64 = 0;
     let mut resolved_items: Vec<(OrderItemInput, String, i64, String)> = Vec::new();
-    // Zbieranie błędów w formie listy dla frontendu
     let mut products_not_found: Vec<i64> = Vec::new();
     let mut insufficient_stock: Vec<StockShortage> = Vec::new();
     for it in &req.items {
@@ -715,7 +658,6 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
         let name: String = row.get("name");
         let price_cents: i64 = row.get("price_cents");
         let stock: i64 = row.get("stock");
-        // first image or default
         let first_image: String = match row.try_get::<Option<String>, _>("images") {
             Ok(Some(s)) => match serde_json::from_str::<serde_json::Value>(&s) {
                 Ok(serde_json::Value::Array(arr)) => arr.into_iter().find_map(|e| e.as_str().map(|s| s.to_string())).unwrap_or_else(|| "orange.png".to_string()),
@@ -745,15 +687,11 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
         return Err(ApiError::BadRequestJson(serde_json::Value::Object(obj)));
     }
 
-    // apply discount: keep subtotal before discount and compute discount amount
-    let subtotal_cents = total_cents;
-    let after_discount = if discount_pct > 0 { subtotal_cents - (subtotal_cents * discount_pct / 100) } else { subtotal_cents };
-    let discount_cents = subtotal_cents - after_discount;
-    // delivery cost can be configured via env DELIVERY_CENTS (in cents). Default 0.
-    let delivery_cents: i64 = env::var("DELIVERY_CENTS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let total_cents = after_discount + delivery_cents;
+    let products_sum_cents = total_cents;
+    let discount_cents = if discount_pct > 0 { products_sum_cents * discount_pct / 100 } else { 0 };
+    let delivery_cents: i64 = if products_sum_cents < 30000 { 1500 } else { 0 };
+    let total_cents = products_sum_cents + delivery_cents - discount_cents;
 
-    // utworz zamowienie
     let now = Utc::now().to_rfc3339();
     let res = sqlx::query("INSERT INTO orders(user_id, status, created_at, delivery_cents, discount_cents, total_cents, total_items, first_name, last_name, city, postal_code, address, promo_code) VALUES(?, 'W drodze', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(user.0)
@@ -773,7 +711,6 @@ async fn create_order(data: web::Data<AppState>, user: AuthUser, body: web::Json
         .map_err(|_| ApiError::Server)?;
     let order_id = res.last_insert_id() as i64;
 
-    // wstaw pozycje i zdejmij stany
     let mut outputs: Vec<OrderItemOutput> = Vec::new();
     for (it, name, price_cents, image) in resolved_items.into_iter() {
         sqlx::query("INSERT INTO order_items(order_id, product_id, quantity, price_cents) VALUES(?, ?, ?, ?)")
@@ -840,7 +777,6 @@ async fn list_orders(data: web::Data<AppState>, user: AuthUser) -> Result<impl R
         .fetch_all(&data.pool)
         .await
         .map_err(|_| ApiError::Server)?;
-    // Build a map order_id -> Vec<String> with first image for each line item
     let order_ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
     let mut order_images: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
     if !order_ids.is_empty() {
@@ -911,7 +847,6 @@ async fn get_order(data: web::Data<AppState>, user: AuthUser, path: web::Path<i6
             image: first_image,
         }
     }).collect();
-    // Status is stored in Polish in the DB; use it directly
     let status: String = row.get("status");
 
     let resp = CreateOrderResponse{
@@ -936,7 +871,6 @@ async fn get_order(data: web::Data<AppState>, user: AuthUser, path: web::Path<i6
 #[get("/api/orders/{id}/status")]
 async fn order_status(data: web::Data<AppState>, user: AuthUser, path: web::Path<i64>) -> Result<impl Responder, ApiError> {
     let id = path.into_inner();
-    // Only allow user to query their own orders; if not found or not owned, respond as 'not found' per spec
     let row = sqlx::query("SELECT status FROM orders WHERE id = ? AND user_id = ?")
         .bind(id)
         .bind(user.0)
@@ -953,7 +887,6 @@ async fn order_status(data: web::Data<AppState>, user: AuthUser, path: web::Path
         }
     }
 
-    // Not found (either doesn't exist or belongs to another user)
     Ok(web::Json(serde_json::json!({"message":"nie udalo sie zlozyc zamowienia","image":"failed.png"})))
 }
 
@@ -1017,18 +950,6 @@ async fn cancel_order(data: web::Data<AppState>, user: AuthUser, path: web::Path
     Ok(web::Json(serde_json::json!({"status":"Anulowane"})))
 }
 
-async fn init_db(_pool: &MySqlPool) -> Result<(), sqlx::Error> {
-    // Initialization from `sql/init.sql` is intentionally disabled.
-    // If you want to run the SQL initialization from file again, uncomment the lines below
-    // and adjust the path as needed for your environment.
-    // let script = fs::read_to_string("/home/patryk/rust-api/sql/init.sql").map_err(sqlx::Error::Io)?;
-    // for stmt in script.split(';') {
-    //     let s = stmt.trim();
-    //     if s.is_empty() || s.starts_with("--") { continue; }
-    //     sqlx::query(s).execute(pool).await?;
-    // }
-    Ok(())
-}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -1041,9 +962,6 @@ async fn main() -> std::io::Result<()> {
 
     let pool = wait_for_mysql_and_connect(&db_url).await;
 
-    // Initialize DB from `sql/init.sql` is currently disabled.
-    // To re-enable, uncomment the line below.
-    // init_db(&pool).await.expect("Inicjalizacja bazy nie powiodła się");
 
     let jwt_secret = env::var("JWT_SECRET").unwrap_or_else(|_| {
         let rand = Uuid::new_v4().to_string();
@@ -1149,13 +1067,11 @@ async fn wait_for_mysql_and_connect(url: &str) -> MySqlPool {
 }
 
 fn load_rustls_config() -> io::Result<ServerConfig> {
-    // Allow overriding paths via env; default to Let's Encrypt paths provided by the user
     let cert_path = env::var("TLS_CERT_PATH")
         .unwrap_or_else(|_| "/etc/letsencrypt/live/securebox.hopto.org/fullchain.pem".to_string());
     let key_path = env::var("TLS_KEY_PATH")
         .unwrap_or_else(|_| "/etc/letsencrypt/live/securebox.hopto.org/privkey.pem".to_string());
 
-    // Read certificate chain
     let mut cert_reader = BufReader::new(File::open(&cert_path)?);
     let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
         .collect::<Result<Vec<_>, _>>()
@@ -1164,14 +1080,12 @@ fn load_rustls_config() -> io::Result<ServerConfig> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Plik certyfikatu nie zawiera żadnych certyfikatów"));
     }
 
-    // Read private key (try PKCS#8 first, then RSA PKCS#1)
     let mut key_reader = BufReader::new(File::open(&key_path)?);
     let mut keys: Vec<PrivateKeyDer<'static>> = pkcs8_private_keys(&mut key_reader)
         .map(|r| r.map(Into::into))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Nieprawidłowy klucz prywatny (PKCS#8)"))?;
     if keys.is_empty() {
-        // Re-open and try RSA keys
         let mut key_reader = BufReader::new(File::open(&key_path)?);
         keys = rsa_private_keys(&mut key_reader)
             .map(|r| r.map(Into::into))
@@ -1183,7 +1097,6 @@ fn load_rustls_config() -> io::Result<ServerConfig> {
     }
     let key = keys.remove(0);
 
-    // Build rustls server config
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)
